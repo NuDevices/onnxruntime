@@ -881,7 +881,7 @@ if (onnxruntime_USE_DNNL)
   )
 endif()
 
-if (onnxruntime_USE_VITISAI)
+if (onnxruntime_USE_VITISAI AND (NOT onnxruntime_ENABLE_GENERIC_INTERFACE))
   add_custom_command(
     TARGET onnxruntime_pybind11_state POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy
@@ -891,7 +891,7 @@ if (onnxruntime_USE_VITISAI)
   )
 endif()
 
-if (onnxruntime_USE_TENSORRT)
+if (onnxruntime_USE_TENSORRT AND (NOT onnxruntime_ENABLE_GENERIC_INTERFACE))
   add_custom_command(
     TARGET onnxruntime_pybind11_state POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy
@@ -911,7 +911,7 @@ if (onnxruntime_USE_MIGRAPHX)
   )
 endif()
 
-if (onnxruntime_USE_OPENVINO)
+if (onnxruntime_USE_OPENVINO AND (NOT onnxruntime_ENABLE_GENERIC_INTERFACE))
     add_custom_command(
       TARGET onnxruntime_pybind11_state POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy
@@ -934,7 +934,7 @@ if (DEFINED ENV{OPENVINO_MANYLINUX})
     )
 endif()
 
-if (onnxruntime_USE_CUDA)
+if (onnxruntime_USE_CUDA AND (NOT onnxruntime_ENABLE_GENERIC_INTERFACE))
     add_custom_command(
       TARGET onnxruntime_pybind11_state POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy
