@@ -83,6 +83,7 @@ stages:
             --volume $(Build.BinariesDirectory):/build \
             --volume $ANDROID_HOME:/android_home \
             --volume $NDK_HOME:/ndk_home \
+	    -w /onnxruntime_src \
             -e ALLOW_RELEASED_ONNX_OPSET_ONLY=1 \
             -e NIGHTLY_BUILD \
             -e BUILD_BUILDNUMBER \
@@ -91,7 +92,7 @@ stages:
             -e BUILD_REASON=$(Build.Reason) \
             -e BUILD_BRANCH=$(Build.SourceBranch) \
             onnxruntimecpubuildcentos8x64_packaging \
-              python3 /onnxruntime_src/tools/ci_build/github/linux/ort_minimal/build_ort_and_check_binary_size.py \
+              python3 -m pip install -r tools/ci_build/requirements/pybind/requirements.txt && python3 tools/ci_build/github/linux/ort_minimal/build_ort_and_check_binary_size.py \
                 --build_dir /build/1a \
                 ${BINARY_SIZE_THRESHOLD_ARGS} \
                 "/onnxruntime_src/${{ parameters.BuildConfigFile }}"
@@ -139,6 +140,7 @@ stages:
               --volume $(Build.BinariesDirectory):/build \
               --volume $ANDROID_HOME:/android_home \
               --volume $NDK_HOME:/ndk_home \
+	      -w /onnxruntime_src \
               -e ALLOW_RELEASED_ONNX_OPSET_ONLY=1 \
               -e NIGHTLY_BUILD \
               -e BUILD_BUILDNUMBER \
@@ -147,7 +149,7 @@ stages:
               -e BUILD_REASON=$(Build.Reason) \
               -e BUILD_BRANCH=$(Build.SourceBranch) \
               onnxruntimecpubuildcentos8x64_packaging \
-                python3 /onnxruntime_src/tools/ci_build/github/linux/ort_minimal/build_ort_and_check_binary_size.py \
+                python3 -m pip install -r tools/ci_build/requirements/pybind/requirements.txt && python3 tools/ci_build/github/linux/ort_minimal/build_ort_and_check_binary_size.py \
                   --build_dir /build/1b \
                   --with_debug_info \
                   "/onnxruntime_src/${{ parameters.BuildConfigFile }}"
