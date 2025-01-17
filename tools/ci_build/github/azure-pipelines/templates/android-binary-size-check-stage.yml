@@ -83,7 +83,7 @@ stages:
             --volume $(Build.BinariesDirectory):/build \
             --volume $ANDROID_HOME:/android_home \
             --volume $NDK_HOME:/ndk_home \
-	    -w /onnxruntime_src \
+            -w /onnxruntime_src \
             -e ALLOW_RELEASED_ONNX_OPSET_ONLY=1 \
             -e NIGHTLY_BUILD \
             -e BUILD_BUILDNUMBER \
@@ -140,7 +140,7 @@ stages:
               --volume $(Build.BinariesDirectory):/build \
               --volume $ANDROID_HOME:/android_home \
               --volume $NDK_HOME:/ndk_home \
-	      -w /onnxruntime_src \
+              -w /onnxruntime_src \
               -e ALLOW_RELEASED_ONNX_OPSET_ONLY=1 \
               -e NIGHTLY_BUILD \
               -e BUILD_BUILDNUMBER \
