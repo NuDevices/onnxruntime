@@ -62,4 +62,3 @@ onnxruntime_add_include_to_target(noexcep_operators ${PROTOBUF_LIB} ${ABSEIL_LIB
 
 add_dependencies(ocos_operators ${onnxruntime_EXTERNAL_DEPENDENCIES})
 add_dependencies(ortcustomops ${onnxruntime_EXTERNAL_DEPENDENCIES})
-
