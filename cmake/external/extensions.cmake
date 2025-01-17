@@ -34,6 +34,8 @@ if (onnxruntime_WEBASSEMBLY_DEFAULT_EXTENSION_FLAGS)
   set(OCOS_ENABLE_CV2 OFF CACHE INTERNAL "")
   set(OCOS_ENABLE_OPENCV_CODECS OFF CACHE INTERNAL "")
   set(OCOS_ENABLE_VISION OFF CACHE INTERNAL "")
+  set(OCOS_ENABLE_AUDIO OFF CACHE INTERNAL "")
+  set(OCOS_ENABLE_DLIB OFF CACHE INTERNAL "")
 endif()
 
 # onnxruntime-extensions
@@ -62,4 +64,3 @@ onnxruntime_add_include_to_target(noexcep_operators ${PROTOBUF_LIB} ${ABSEIL_LIB
 
 add_dependencies(ocos_operators ${onnxruntime_EXTERNAL_DEPENDENCIES})
 add_dependencies(ortcustomops ${onnxruntime_EXTERNAL_DEPENDENCIES})
-
