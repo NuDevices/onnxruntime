@@ -94,12 +94,14 @@ stages:
         env:
           PROCESSOR_ARCHITECTURE: ${{ parameters.BuildArch }}
 
+
       - script: python -m pip install -r $(Build.SourcesDirectory)\tools\ci_build\github\linux\python\requirements.txt
+
       - task: PythonScript@0
         displayName: 'Generate cmake config'
         inputs:
           scriptPath: '$(Build.SourcesDirectory)\tools\ci_build\build.py'
-          arguments: '$(BuildCommand) --use_binskim_compliant_compile_flags --parallel --path_to_protoc_exe $(Build.BinariesDirectory)\installed\bin\protoc.exe --build_csharp --update --config $(BuildConfig) ${{ variables.build_py_lto_flag }}'
+          arguments: '$(BuildCommand) --use_binskim_compliant_compile_flags --parallel --build_csharp --update --config $(BuildConfig) ${{ variables.build_py_lto_flag }}'
           workingDirectory: '$(Build.BinariesDirectory)'
 
       - ${{ if notIn(parameters['sln_platform'], 'Win32', 'x64') }}:
