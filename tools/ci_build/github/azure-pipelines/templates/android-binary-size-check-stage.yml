@@ -41,10 +41,10 @@ stages:
     #TODO: use a different docker file since this job doesn't need to rely on manylinux
     - template: get-docker-image-steps.yml
       parameters:
-        Dockerfile: tools/ci_build/github/linux/docker/Dockerfile.manylinux2_28_cpu
-        Context: tools/ci_build/github/linux/docker
+        Dockerfile: tools/ci_build/github/linux/docker/inference/x86_64/default/cpu/Dockerfile
+        Context: tools/ci_build/github/linux/docker/inference/x86_64/default/cpu
         DockerBuildArgs: "--build-arg BUILD_UID=$( id -u )"
-        Repository: onnxruntimecpubuild
+        Repository: onnxruntimecpubuildcentos8x64_packaging
 
     - task: PythonScript@0
       displayName: 'Set variables from config file "${{ parameters.BuildConfigFile }}"'
@@ -90,8 +90,8 @@ stages:
             -e BUILD_ID=$(Build.BuildId) \
             -e BUILD_REASON=$(Build.Reason) \
             -e BUILD_BRANCH=$(Build.SourceBranch) \
-            onnxruntimecpubuild \
-              PATH=/opt/python/cp310-cp310/bin:$PATH python /onnxruntime_src/tools/ci_build/github/linux/ort_minimal/build_ort_and_check_binary_size.py \
+            onnxruntimecpubuildcentos8x64_packaging \
+              python3 /onnxruntime_src/tools/ci_build/github/linux/ort_minimal/build_ort_and_check_binary_size.py \
                 --build_dir /build/1a \
                 ${BINARY_SIZE_THRESHOLD_ARGS} \
                 "/onnxruntime_src/${{ parameters.BuildConfigFile }}"
@@ -146,8 +146,8 @@ stages:
               -e BUILD_ID=$(Build.BuildId) \
               -e BUILD_REASON=$(Build.Reason) \
               -e BUILD_BRANCH=$(Build.SourceBranch) \
-              onnxruntimecpubuild \
-                PATH=/opt/python/cp310-cp310/bin:$PATH python /onnxruntime_src/tools/ci_build/github/linux/ort_minimal/build_ort_and_check_binary_size.py \
+              onnxruntimecpubuildcentos8x64_packaging \
+                python3 /onnxruntime_src/tools/ci_build/github/linux/ort_minimal/build_ort_and_check_binary_size.py \
                   --build_dir /build/1b \
                   --with_debug_info \
                   "/onnxruntime_src/${{ parameters.BuildConfigFile }}"

@@ -12,14 +12,7 @@ vcpkg_from_github(
 
 string(COMPARE EQUAL "${VCPKG_CRT_LINKAGE}" "static" USE_STATIC_RUNTIME)
 
-# ONNX_USE_PROTOBUF_SHARED_LIBS: find the library and check its file extension
-find_library(PROTOBUF_LIBPATH NAMES protobuf PATHS "${CURRENT_INSTALLED_DIR}/bin" "${CURRENT_INSTALLED_DIR}/lib" REQUIRED)
-get_filename_component(PROTOBUF_LIBNAME "${PROTOBUF_LIBPATH}" NAME)
-if(PROTOBUF_LIBNAME MATCHES "${CMAKE_SHARED_LIBRARY_SUFFIX}")
-    set(USE_PROTOBUF_SHARED ON)
-else()
-    set(USE_PROTOBUF_SHARED OFF)
-endif()
+set(USE_PROTOBUF_SHARED OFF)
 
 # Like protoc, python is required for codegen.
 vcpkg_find_acquire_program(PYTHON3)
