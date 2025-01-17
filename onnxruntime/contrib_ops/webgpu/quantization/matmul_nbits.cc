@@ -536,43 +536,42 @@ Status DP4AMatMulQuantizeProgram::GenerateShaderCode(ShaderHelper& shader) const
   shader.AddOutput("scales", ShaderUsage::UseUniform);
 
   shader.AdditionalImplementation() << R"ADDNL_FN(
-    var<workgroup> max_values : array<f16, 2>;
+    var<workgroup> max_values : array<f16, 4>;
  )ADDNL_FN";
 
   shader.MainFunctionBody() << R"MAIN_FN(
-    var local_a = input_a[global_idx];
-    var max_val = subgroupMax(abs(local_a));
-    var max_temp = max(max_val.xy, max_val.zw);
-    var scale = max(max_temp[0], max_temp[1]);
-    if (sg_size == 8)
-    {
-      if (local_idx % sg_size == 0) {
-        max_values[local_idx / sg_size] = scale;
-      }
-      workgroupBarrier();
-      scale = max(max_values[0], max_values[1]);
-    }
-    var norm_a = local_a/scale;
-    output[global_idx] = pack4x8snorm(vec4<f32>(norm_a));
-    if (local_idx == 0)
-    {
-      // 127 is the max value of signed int8 [-127,127] used by pack4x8snorm for 1.0f.
-      scales[workgroup_idx] = scale/127;
-    }
+  var local_a = input_a[global_idx];
+  var max_val = subgroupMax(abs(local_a));
+  var max_temp = max(max_val.xy, max_val.zw);
+  var scale = max(max_temp[0], max_temp[1]);
+  if (local_idx % sg_size == 0) {
+    max_values[local_idx / sg_size] = scale;
+  }
+  workgroupBarrier();
+
+  if (sg_size == 8)
+  {
+    scale = max(max_values[0], max_values[1]);
+    scale = max(scale, max_values[2]);
+    scale = max(scale, max_values[3]);
+  }
+  else if (sg_size == 16)
+  {
+    scale = max(max_values[0], max_values[1]);
+  }
+  else
+  {
+    scale = max_values[0];
+  }
+
+  var norm_a = local_a/scale;
+  output[global_idx] = pack4x8snorm(vec4<f32>(norm_a));
+  if (local_idx == 0)
+  {
+    // 127 is the max value of signed int8 [-127,127] used by pack4x8snorm for 1.0f.
+    scales[workgroup_idx] = scale/127;
+  }
 )MAIN_FN";
-  return Status::OK();
-}
-
-Status DP4AMatMulDeQuantizeProgram::GenerateShaderCode(ShaderHelper& shader) const {
-  shader.AddInput("input", ShaderUsage::UseUniform);
-  shader.AddInput("scales", ShaderUsage::UseUniform);
-  shader.AddOutput("output", ShaderUsage::UseUniform);
-
-  shader.MainFunctionBody() << R"MAIN_FN(
-  var local_a = unpack4xI8(input[workgroup_id.x*16 + local_idx/4]);
-  output[workgroup_id.x*64+local_idx ] = f16(local_a[local_idx%4]) * scales[workgroup_id.x];
-)MAIN_FN";
-
   return Status::OK();
 }
 
@@ -609,141 +608,149 @@ Status DP4AMatMulNBitsProgram::GenerateShaderCode(ShaderHelper& shader) const {
   // matmulnbits input with block size 32.
 
   shader.AdditionalImplementation() << R"ADDNL_FN(
-  const tile_size_a = 64;
-  const tile_size_b = 64;
+  const tile_size = 64;
+  const subtile_size = 16;
   const tile_size_k =  64;
   const vec_factor = 4;
   const u32_factor = 4;
-  const tile_size_kv = 4;
-  const tile_k_scale_count = 2;
+  const tile_size_k_vec = 4;
   const block_size = 32;
-  const subgroup_count = 16;
 
-  //Shared memory
-  var<workgroup> tile_A : array<array<vec4<u32>, tile_size_kv>, tile_size_a>;                        // 64 x 64
-  var<workgroup> scale_A : array<f16, tile_size_a>;                                                  // 64 x 1
-  var<workgroup> tile_B : array<array<vec4<u32>, tile_size_kv>, tile_size_b>;                        // 64 x 64
-  var<workgroup> scale_B : array<vec2<f16>, tile_size_b>;                                            // 64 x 2
+  // Shared memory
+  var<workgroup> tile_A : array<array<vec4<u32>, tile_size_k_vec>, tile_size>;                     // 64 x 64
+  var<workgroup> scale_A : array<f16, tile_size>;                                                  // 64 x 1
+  var<workgroup> tile_B : array<array<vec4<u32>, tile_size_k_vec>, tile_size>;                     // 64 x 64
+  var<workgroup> scale_B : array<vec2<f16>, tile_size>;                                            // 64 x 2
 
-  fn loadSHMA(a_global_base:u32, kidx_v:u32, subtile_id: u32, sg_id: u32)
+  // Private memory
+  var<private> lane_output: array<f16, 16>;
+
+  fn loadSHMA(a_global_base:u32, kidx_v:u32, row: u32, col: u32)
   {
-    // Workgroup needs to fill 64 slots, there are 16 subgroups in the workgroup.
-    // Each subgroup fills out 4 slots.
-    let a_slot = subtile_id * 4 + sg_id/4;
-    let a_global = a_global_base + a_slot;
+    let a_global = a_global_base + row;
     if (a_global >= uniforms.M)
     {
       return;
     }
-    tile_A[a_slot][sg_id%4] = input_a[a_global*uniforms.K16+kidx_v+sg_id%4];
-    if (sg_id%4 == 0)
+    tile_A[row][col] = input_a[a_global*uniforms.K16+kidx_v+col];
+    if (col == 0)
     {
-      // kidx_v - each kidx_v covers 16 values of k, therefore 4 index must share
-      // a single scale kidx_v/4.
-      scale_A[a_slot] = scales_a[a_global*(uniforms.K/64) + kidx_v/4];
+      // kidx_v - each kidx_v covers 16 values of k, therefore 8 index
+      // (8*14 = 128) will share a single scale, index by kidx_v/8 below.
+      scale_A[row] = scales_a[a_global*(uniforms.K/128) + kidx_v/8];
     }
   }
 
-  fn loadSHMB(b_global_base:u32, kidx_v:u32, subtile_id: u32, sg_id: u32)
+  fn loadSHMB(b_global_base:u32, kidx_v:u32, row: u32, col: u32)
   {
-      // Workgroup needs to fill 64 slots, there are 16 subgroups in the workgroup.
-      // Each subgroup fills out 4 slots.
-      let b_slot = subtile_id * 4 + sg_id/4;
-      let weight_offset:u32 = kidx_v + sg_id%4;
-      let b_global = b_global_base + b_slot;
+      let b_global = b_global_base + row;
       if (b_global >= uniforms.N)
       {
         return;
       }
 
-      let b_value = input_b[b_global*uniforms.K16+weight_offset];
+      let b_value = input_b[b_global*uniforms.K16+kidx_v+col];
       var b_value_lower = vec4<i32>(unpack4xU8(b_value[0] & 0x0F0F0F0Fu)) - vec4<i32>(8);
       var b_value_upper = vec4<i32>(unpack4xU8((b_value[0] >> 4) & 0x0F0F0F0Fu)) - vec4<i32>(8);
-      tile_B[b_slot][sg_id%4][0] = pack4xI8(vec4<i32>(b_value_lower[0], b_value_upper[0], b_value_lower[1], b_value_upper[1]));
-      tile_B[b_slot][sg_id%4][1] = pack4xI8(vec4<i32>(b_value_lower[2], b_value_upper[2], b_value_lower[3], b_value_upper[3]));
+      tile_B[row][col][0] = pack4xI8(vec4<i32>(b_value_lower[0], b_value_upper[0], b_value_lower[1], b_value_upper[1]));
+      tile_B[row][col][1] = pack4xI8(vec4<i32>(b_value_lower[2], b_value_upper[2], b_value_lower[3], b_value_upper[3]));
       b_value_lower = vec4<i32>(unpack4xU8(b_value[1] & 0x0F0F0F0Fu)) - vec4<i32>(8);
       b_value_upper = vec4<i32>(unpack4xU8((b_value[1] >> 4) & 0x0F0F0F0Fu)) - vec4<i32>(8);
-      tile_B[b_slot][sg_id%4][2] = pack4xI8(vec4<i32>(b_value_lower[0], b_value_upper[0], b_value_lower[1], b_value_upper[1]));
-      tile_B[b_slot][sg_id%4][3] = pack4xI8(vec4<i32>(b_value_lower[2], b_value_upper[2], b_value_lower[3], b_value_upper[3]));
-      if (sg_id%4 == 0)
+      tile_B[row][col][2] = pack4xI8(vec4<i32>(b_value_lower[0], b_value_upper[0], b_value_lower[1], b_value_upper[1]));
+      tile_B[row][col][3] = pack4xI8(vec4<i32>(b_value_lower[2], b_value_upper[2], b_value_lower[3], b_value_upper[3]));
+      if (col == 0)
       {
         // kidx_v - each kidx_v covers 16 values of k, therefore 4 index must share
         // a single scale kidx_v/2. But scales_b is a vec2, making the math same as A.
-        scale_B[b_slot] = scales_b[b_global*(uniforms.K/64) + kidx_v/4];
+        scale_B[row] = scales_b[b_global*(uniforms.K/64) + kidx_v/4];
       }
   }
 
-  // Implement a 16x64x16 matrix multiply primitive using the 16 lanes of the subgroup.
+  fn DP4AI(a:vec4<u32>, b:vec4<u32>) -> i32
+  {
+      var local_sum = dot4I8Packed(a[0], b[0]);
+      local_sum += dot4I8Packed(a[1], b[1]);
+      local_sum += dot4I8Packed(a[2], b[2]);
+      local_sum += dot4I8Packed(a[3], b[3]);
+      return local_sum;
+  }
+
+  // Implement a 16x64x16 matrix multipy primitive using the 16 lanes of the subgroup.
   // Each Lane first loads a row of A and a column of B.
   // Then each lane becomes responsible for a row and loops through the columns to compute
   // dot product. The columns are fetched from other owning lanes using subgroupShuffle.
-  fn perform16_64_16MatMul(base_A:u32, base_B:u32, sg_id:u32, lane_output: ptr<function,array<f16, 16>>)
+  fn perform16_64_16MatMul_sgsize16(base_A:u32, base_B:u32, sg_id:u32)
   {
-    var own_a: array<vec4<u32>, tile_size_kv>;
-    var own_b: array<vec4<u32>, tile_size_kv>;
+    var own_a0: vec4<u32> = tile_A[base_A + sg_id][0];
+    var own_a1: vec4<u32> = tile_A[base_A + sg_id][1];
+    var own_a2: vec4<u32> = tile_A[base_A + sg_id][2];
+    var own_a3: vec4<u32> = tile_A[base_A + sg_id][3];
+    var own_b0: vec4<u32> = tile_B[base_B + sg_id][0];
+    var own_b1: vec4<u32> = tile_B[base_B + sg_id][1];
+    var own_b2: vec4<u32> = tile_B[base_B + sg_id][2];
+    var own_b3: vec4<u32> = tile_B[base_B + sg_id][3];
     var own_scale_b: vec2<f16> = scale_B[base_B + sg_id];
     var own_scale_a: f16 = scale_A[base_A+sg_id];;
-
-    for (var i:u32 = 0; i < tile_size_kv; i++)
-    {
-      own_a[i] = tile_A[base_A + sg_id][i];
-      own_b[i] = tile_B[base_B + sg_id][i];
-    }
 
     for (var col:u32 = 0; col < 16; col++)
     {
       var local_scale_b = subgroupShuffle(own_scale_b, col);
       local_scale_b = local_scale_b * own_scale_a;
-      for (var j:u32 = 0; j < 2; j++){
-        var local_sum = 0;
-        for (var k:u32 = 0; k < 2; k++){
-          let idx = j*2+ k;
-          var local_b = own_b[idx];
-          local_b = subgroupShuffle(local_b, col);
-          let local_a = own_a[idx];
-          local_sum += dot4I8Packed(local_a[0], local_b[0]);
-          local_sum += dot4I8Packed(local_a[1], local_b[1]);
-          local_sum += dot4I8Packed(local_a[2], local_b[2]);
-          local_sum += dot4I8Packed(local_a[3], local_b[3]);
-        }
-        lane_output[col] += f16(local_sum) * local_scale_b[j];
-      }
+      var local_b = own_b0;
+      local_b = subgroupShuffle(local_b, col);
+      var local_sum = DP4AI(own_a0, local_b);
+      local_b = own_b1;
+      local_b = subgroupShuffle(local_b, col);
+      local_sum += DP4AI(own_a1, local_b);
+      local_b = own_b2;
+      local_b = subgroupShuffle(local_b, col);
+      var local_sum2 = DP4AI(own_a2, local_b);
+      local_b = own_b3;
+      local_b = subgroupShuffle(local_b, col);
+      local_sum2 += DP4AI(own_a3, local_b);
+      lane_output[col] += (f16(local_sum) * local_scale_b[0] + f16(local_sum2) * local_scale_b[1]);
     }
   }
+
 )ADDNL_FN";
 
   shader.MainFunctionBody() << R"MAIN_FN(
-  let subtile_id = u32(local_idx / sg_size);
+  // During the load phase we use all 256 threads to load 64 rows of A/B.
+  // For each row we load 4 vectorized elements, which are 64 elements of K.
+  let a_global_base = workgroup_id.x * tile_size;
+  let b_global_base = workgroup_id.y * tile_size;
+  let load_row = u32(local_idx/4);
+  let load_col = u32(local_idx%4);
+
+  // During the compute phase, we have the 64x64 tile split into
+  // subtiles of 16x16. We have a grid of 4x4 subtiles.
+  let subtile_id = u32(local_idx / subtile_size);
   let subtile_idx = u32(subtile_id / 4);
   let subtile_idy = u32(subtile_id % 4);
-
-  let a_global_base = workgroup_id.x * tile_size_a;
-  let b_global_base = workgroup_id.y * tile_size_b;
-
-  // Output accumulation
-  var lane_output: array<f16, 16>;
-  // Clear the accumulator
-  for (var i:u32 = 0; i < 16; i++)
-  {
-    lane_output[i] = 0;
-  }
+  let subtile_a_base = subtile_idx * 16;
+  let subtile_b_base = subtile_idy * 16;
+  // For each subtile we have 16 threads assigned.
+  let subtile_thread_id = u32(local_idx % subtile_size);
 
   // K's vectrorization is 16 items per index. See input_a/input_b.
-  // tile_size_kv - is the k tile size in vectorized k units/space (1/16).
-  for (var kidx_v:u32 = 0; kidx_v < uniforms.K16; kidx_v+=tile_size_kv)
+  // tile_size_k_vec - is the k tile size in vectorized k units/space (1/16).
+  for (var kidx_v:u32 = 0; kidx_v < uniforms.K16; kidx_v+=tile_size_k_vec)
   {
     // Populate shared memory for the workgroup
-    loadSHMA(a_global_base, kidx_v, subtile_id, sg_id);
-    loadSHMB(b_global_base, kidx_v, subtile_id, sg_id);
+    loadSHMA(a_global_base, kidx_v, load_row, load_col);
+    loadSHMB(b_global_base, kidx_v, load_row, load_col);
     workgroupBarrier();
 
     // Perform the matmul for the subtile this subgroup is responsible for.
-    perform16_64_16MatMul(subtile_idx*16, subtile_idy*16, sg_id, &lane_output);
+    if (sg_size == 16)
+    {
+      perform16_64_16MatMul_sgsize16(subtile_a_base, subtile_b_base, sg_id);
+    }
     workgroupBarrier();
   }
 
-  let a_global = a_global_base + subtile_idx * 16+ sg_id;
-  let b_global = b_global_base + subtile_idy * 16;
+  let a_global = a_global_base + subtile_a_base + subtile_thread_id;
+  let b_global = b_global_base + subtile_b_base;
   let output_idx = ((a_global) * uniforms.N + b_global)/4;
   // This creates a shader requirement that uniforms.N % 16 == 0
   if (a_global < uniforms.M && b_global < uniforms.N)
@@ -794,8 +801,6 @@ Status MatMulNBits::ComputeInternal(onnxruntime::webgpu::ComputeContext& context
   uint32_t components = GetMaxComponents(N);
 
   const bool has_zero_points = zero_points != nullptr;
-
-  Tensor a_clone = context.CreateGPUTensor(a->DataType(), a->Shape());
   if (block_size == 32 && batch_count == 1 &&
       components_a == 4 && K % 64 == 0 &&
       !has_zero_points && M >= kMinMForTileOptimization) {
@@ -803,9 +808,9 @@ Status MatMulNBits::ComputeInternal(onnxruntime::webgpu::ComputeContext& context
     constexpr uint32_t kVec2Components = 2;
     constexpr uint32_t kU32Components = 4;
 
-    constexpr uint32_t kBlockSizeA = 64;
+    constexpr uint32_t kBlockSizeA = 128;
     DP4AMatMulQuantizeProgram quantize_program;
-    quantize_program.SetWorkgroupSize(16);
+    quantize_program.SetWorkgroupSize(32);
     quantize_program.SetDispatchGroupSize(M*K/kBlockSizeA, 1, 1);
     TensorShape a_quant_shape{1, M, K/kU32Components};
     Tensor a_quant = context.CreateGPUTensor(DataTypeImpl::GetType<uint32_t>(), a_quant_shape);
@@ -815,17 +820,6 @@ Status MatMulNBits::ComputeInternal(onnxruntime::webgpu::ComputeContext& context
           .AddOutputs({{&a_quant, ProgramTensorMetadataDependency::Rank, a_quant.Shape(), gsl::narrow<int>(1)},
                       {&a_scale, ProgramTensorMetadataDependency::Rank, a_scale.Shape(), gsl::narrow<int>(1)}});
     ORT_RETURN_IF_ERROR(context.RunProgram(quantize_program));
-
-    // Enable this block and disable the matmul block below to test if quantization is correct.
-    // DP4AMatMulDeQuantizeProgram dequantize_program;
-    // dequantize_program.SetWorkgroupSize(64);
-    // dequantize_program.SetDispatchGroupSize(M*K/kBlockSizeA, 1, 1);
-    // dequantize_program.AddInputs({
-    //   {&a_quant, ProgramTensorMetadataDependency::TypeAndRank, gsl::narrow<int>(1)},
-    //   {&a_scale, ProgramTensorMetadataDependency::TypeAndRank, gsl::narrow<int>(1)}})
-    //   .AddOutput({&a_clone, ProgramTensorMetadataDependency::Rank, a->Shape(), gsl::narrow<int>(1)});
-    // ORT_RETURN_IF_ERROR(context.RunProgram(dequantize_program));
-    // a = &a_clone;
 
     constexpr uint32_t kTileSize = 64;
     TensorShape reshaped_y_shape{1, M, N / kVec4Components};
