@@ -415,8 +415,7 @@ static Status PartitionOnnxFormatModelImpl(Graph& graph, FuncManager& func_mgr,
                                            int& fused_node_unique_id,
                                            const layout_transformation::TransformLayoutFunction& transform_layout_fn,
                                            const layout_transformation::DebugGraphFn& debug_graph_fn,
-                                           IResourceAccountant* resource_accountant) {
-                                           const logging::Logger& logger) {
+                                           const logging::Logger& logger, IResourceAccountant* resource_accountant) {
   // handle testing edge case where optimizers or constant lifting results in graph with no nodes.
   // doing it here saves all providers checking for this in GetCapability
   if (graph.NumberOfNodes() == 0) {
@@ -810,7 +809,7 @@ static Status PartitionOnnxFormatModel(const PartitionParams& partition_params, 
                                                        fused_kernel_registry, *ep, mode, fused_node_unique_id,
                                                        transform_layout_function,
                                                        partition_params.debug_graph_fn,
-                                                       resource_accountant, logger));
+                                                       logger, resource_accountant));
     }
 
     // expand any nodes that have an ONNX function definition but no matching ORT kernel.
@@ -1071,9 +1070,8 @@ Status GraphPartitioner::Partition(Graph& graph, FuncManager& func_mgr,
 
   if (mode == Mode::kNormal || mode == Mode::kAssignOnly) {
 #if !defined(ORT_MINIMAL_BUILD)
-    ORT_RETURN_IF_ERROR(PartitionOnnxFormatModel(partition_params, mode, providers_, kernel_registry_mgr_, epp_acc_map, logger));
-
-                                                 ep_acc_map));
+    ORT_RETURN_IF_ERROR(PartitionOnnxFormatModel(partition_params, mode, providers_, kernel_registry_mgr_,
+                                                 ep_acc_map, logger));
 
     bool ep_context_enabled = config_options.GetConfigOrDefault(kOrtSessionOptionEpContextEnable, "0") == "1";
     std::string ep_context_path = config_options.GetConfigOrDefault(kOrtSessionOptionEpContextFilePath, "");
