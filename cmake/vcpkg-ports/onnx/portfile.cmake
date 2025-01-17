@@ -12,7 +12,13 @@ vcpkg_from_github(
 
 string(COMPARE EQUAL "${VCPKG_CRT_LINKAGE}" "static" USE_STATIC_RUNTIME)
 
+# ONNX_USE_PROTOBUF_SHARED_LIBS: find the library and check its file extension
+find_library(PROTOBUF_LIBPATH NAMES protobuf PATHS "${CURRENT_INSTALLED_DIR}/bin" "${CURRENT_INSTALLED_DIR}/lib" REQUIRED)
+get_filename_component(PROTOBUF_LIBNAME "${PROTOBUF_LIBPATH}" NAME)
+
 set(USE_PROTOBUF_SHARED OFF)
+
+
 
 # Like protoc, python is required for codegen.
 vcpkg_find_acquire_program(PYTHON3)
@@ -33,6 +39,7 @@ vcpkg_cmake_configure(
         -DONNX_USE_MSVC_STATIC_RUNTIME=${USE_STATIC_RUNTIME}
         -DONNX_BUILD_TESTS=OFF
         -DONNX_BUILD_BENCHMARKS=OFF
+        -DONNX_DISABLE_STATIC_REGISTRATION=ON
     MAYBE_UNUSED_VARIABLES
         ONNX_USE_MSVC_STATIC_RUNTIME
 )
