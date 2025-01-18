@@ -863,7 +863,8 @@ def run_subprocess(
             my_env["PYTHONPATH"] = python_path
 
     my_env.update(env)
-
+    if args.android and args.use_vcpkg = True and args.android_ndk_home is not None:
+        my_env["ANDROID_NDK_HOME"] = args.android_ndk_home
     log.info(" ".join(args))
     return run(*args, cwd=cwd, capture_stdout=capture_stdout, shell=shell, env=my_env)
 
