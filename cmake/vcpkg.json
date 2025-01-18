@@ -24,21 +24,18 @@
       "host": true,
       "version>=": "23.5.26"
     },
+    "fp16",
     {
       "name": "flatbuffers",
       "version>=": "23.5.26"
     },
+    {
+      "name": "mimalloc",
+      "platform": "windows"
+    },
     "ms-gsl",
     "nlohmann-json",
-    {
-      "name": "nsync",
-      "platform": "!windows",
-      "version>=": "1.26.0"
-    },
-    {
-      "name": "onnx",
-      "version>=": "1.16.2"
-    },
+    "onnx",
     "optional-lite",
     {
       "name": "protobuf",
@@ -49,6 +46,7 @@
       "host": true,
       "version>=": "3.21.12"
     },
+    "pthreadpool",
     "re2",
     "safeint",
     "utf8-range",
@@ -60,7 +58,11 @@
       "name": "vcpkg-cmake-config",
       "host": true
     },
-    "wil",
+    {
+      "name": "wil",
+      "platform": "windows"
+    },
+    "xnnpack",
     {
       "name": "zlib",
       "platform": "windows"

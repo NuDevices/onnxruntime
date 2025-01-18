@@ -108,11 +108,11 @@ stages:
             -e BUILD_BUILDNUMBER \
             -e CCACHE_DIR=/cache \
             $(Repository) \
-            /bin/bash -c "
+            /bin/bash -c '
               set -ex; \
               env; \
               ccache -s; \
-              /opt/python/cp310-cp310/bin/python3 /onnxruntime_src/tools/ci_build/build.py \
+              PATH=/opt/python/cp310-cp310/bin:$PATH  /opt/python/cp310-cp310/bin/python3 /onnxruntime_src/tools/ci_build/build.py \
                 --build_dir /build --cmake_generator Ninja \
                 --config Release --update --build \
                 --skip_submodule_sync \
@@ -125,7 +125,7 @@ stages:
                 --use_cache \
                 --cmake_extra_defines  'CMAKE_CUDA_ARCHITECTURES=75;86' ; \
                 ccache -sv; \
-                ccache -z"
+                ccache -z'
         workingDirectory: $(Build.SourcesDirectory)
 
     - task: CmdLine@2

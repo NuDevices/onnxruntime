@@ -471,6 +471,7 @@ def parse_arguments():
     parser.add_argument(
         "--use_vcpkg",
         action="store_true",
+        default="VCPKG_INSTALLATION_ROOT" in os.environ,
         help="Use vcpkg to search dependencies. Requires CMAKE_TOOLCHAIN_FILE for vcpkg.cmake",
     )
 
@@ -862,7 +863,6 @@ def run_subprocess(
             my_env["PYTHONPATH"] = python_path
 
     my_env.update(env)
-
     log.info(" ".join(args))
     return run(*args, cwd=cwd, capture_stdout=capture_stdout, shell=shell, env=my_env)
 
@@ -1122,17 +1122,17 @@ def generate_build_tree(
         overlay_triplets_dir = None
         # The enable_address_sanitizer and use_binskim_compliant_compile_flags flags cannot be both enabled
         if args.enable_address_sanitizer:
-            overlay_triplets_dir = os.path.join(source_dir, "cmake", "vcpkg_triplets", "asan")
+            overlay_triplets_dir = os.path.join(source_dir, "cmake", "vcpkg-triplets", "asan")
             if args.disable_rtti:
                 overlay_triplets_dir += "_nortti"
         elif args.use_binskim_compliant_compile_flags:
-            overlay_triplets_dir = os.path.join(source_dir, "cmake", "vcpkg_triplets", "binskim")
+            overlay_triplets_dir = os.path.join(source_dir, "cmake", "vcpkg-triplets", "binskim")
             if args.disable_rtti:
                 overlay_triplets_dir += "_nortti"
         elif args.disable_rtti:
-            overlay_triplets_dir = os.path.join(source_dir, "cmake", "vcpkg_triplets", "nortti")
+            overlay_triplets_dir = os.path.join(source_dir, "cmake", "vcpkg-triplets", "nortti")
         if overlay_triplets_dir is None:
-            overlay_triplets_dir = os.path.join(source_dir, "cmake", "vcpkg_triplets", "default")
+            overlay_triplets_dir = os.path.join(source_dir, "cmake", "vcpkg-triplets", "default")
         vcpkg_install_options.append(f"--overlay-triplets={overlay_triplets_dir}")
 
         # VCPKG_INSTALL_OPTIONS is a CMake list. It must be joined by semicolons
@@ -1946,7 +1946,12 @@ def run_android_tests(args, source_dir, build_dir, config, cwd):
             context_stack.callback(android.stop_emulator, emulator_proc)
 
         adb_push("testdata", device_dir, cwd=cwd)
-        adb_push(os.path.join(source_dir, "cmake", "external", "onnx", "onnx", "backend", "test"), device_dir, cwd=cwd)
+        if is_linux() and os.path.exists("/data/onnx"):
+            adb_push("/data/onnx", device_dir + "/test", cwd=cwd)
+        else:
+            test_data_dir = os.path.join(source_dir, "cmake", "external", "onnx", "onnx", "backend", "test")
+            if os.path.exists(test_data_dir):
+                adb_push(test_data_dir, device_dir + "/test", cwd=cwd)
         adb_push("onnxruntime_test_all", device_dir, cwd=cwd)
         adb_shell(f"chmod +x {device_dir}/onnxruntime_test_all")
         adb_push("onnx_test_runner", device_dir, cwd=cwd)
@@ -2606,8 +2611,24 @@ def main():
 
     print(args)
 
+    if args.build_wasm or args.use_webgpu:
+        # No custom triplet for the wasm builds yet
+        args.use_vcpkg = False
+    elif args.minimal_build is not None:
+        # Minimal build uses a custom ONNX cmake file. Don't know how to deal with it yet
+        args.use_vcpkg = False
+    elif args.ios:
+        args.use_vcpkg = False
+    elif args.use_extensions:
+        # ORT extension no longer supports combined build, except for WASM. Due to dependency version conflicts
+        args.use_vcpkg = False
+
     if os.getenv("ORT_BUILD_WITH_CACHE") == "1":
         args.use_cache = True
+
+    # VCPKG's scripts/toolchains/android.cmake has logic for autodetecting NDK home when the ANDROID_NDK_HOME env is not set, but it is only implemented for Windows
+    if args.android and args.use_vcpkg and args.android_ndk_path is not None and os.path.exists(args.android_ndk_path):
+        os.environ["ANDROID_NDK_HOME"] = args.android_ndk_path
 
     if not is_windows():
         if not args.allow_running_as_root:
