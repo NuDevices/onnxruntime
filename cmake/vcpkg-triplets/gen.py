@@ -88,8 +88,10 @@ for enable_rtti in [True, False]:
                             # Disable RTTI and turn usage of dynamic_cast and typeid into errors
                             cxxflags += ["/GR-", "/we4541"]
                         # TODO: should it be a cmake list separated by semicolons?
-                        f.write('set(VCPKG_C_FLAGS "{}")\n'.format(" ".join(cflags)))
-                        f.write('set(VCPKG_CXX_FLAGS "{}")\n'.format(" ".join(cxxflags)))
+                        if len(cflags) >= 1:
+                            f.write('set(VCPKG_C_FLAGS "{}")\n'.format(" ".join(cflags)))
+                        if len(cxxflags) >= 1:
+                            f.write('set(VCPKG_CXX_FLAGS "{}")\n'.format(" ".join(cxxflags)))
                         f.write("list(APPEND VCPKG_CMAKE_CONFIGURE_OPTIONS --compile-no-warning-as-error -DVCPKG_CMAKE_CONFIGURE_OPTIONS=17)\n")
                         if ldflags:
                             f.write('set(VCPKG_LINKER_FLAGS "{}")\n'.format(" ".join(ldflags)))
@@ -146,11 +148,12 @@ for os_name in ["linux", "osx"]:
                                 ldflags = []
                             cflags = []
                             if enable_binskim:
-                                cflags += [
-                                    "-Wp,-D_FORTIFY_SOURCE=2",
-                                    "-Wp,-D_GLIBCXX_ASSERTIONS",
-                                    "-fstack-protector-strong",
-                                ]
+                                # TODO: enable the following flags for optimized build
+                                #cflags += [
+                                #    "-Wp,-D_FORTIFY_SOURCE=2",
+                                #    "-Wp,-D_GLIBCXX_ASSERTIONS",
+                                #    "-fstack-protector-strong",
+                                #]
                                 if target_abi == "x64":
                                     cflags += ["-fstack-clash-protection", "-fcf-protection"]
                             elif enable_asan:
@@ -163,8 +166,10 @@ for os_name in ["linux", "osx"]:
                             cxxflags = cflags.copy()
                             if not enable_rtti:
                                 cxxflags.append("-fno-rtti")
-                            f.write('set(VCPKG_C_FLAGS "{}")\n'.format(" ".join(cflags)))
-                            f.write('set(VCPKG_CXX_FLAGS "{}")\n'.format(" ".join(cxxflags)))
+                            if len(cflags) >= 1:
+                                f.write('set(VCPKG_C_FLAGS "{}")\n'.format(" ".join(cflags)))
+                            if len(cxxflags) >= 1:
+                                f.write('set(VCPKG_CXX_FLAGS "{}")\n'.format(" ".join(cxxflags)))
                             if os_name == "linux":
                                 f.write("set(VCPKG_CMAKE_SYSTEM_NAME Linux)\n")
                             else:
