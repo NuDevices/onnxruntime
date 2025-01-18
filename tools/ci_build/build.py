@@ -863,8 +863,6 @@ def run_subprocess(
             my_env["PYTHONPATH"] = python_path
 
     my_env.update(env)
-    if args.android and args.use_vcpkg = True and args.android_ndk_home is not None:
-        my_env["ANDROID_NDK_HOME"] = args.android_ndk_home
     log.info(" ".join(args))
     return run(*args, cwd=cwd, capture_stdout=capture_stdout, shell=shell, env=my_env)
 
@@ -2624,6 +2622,10 @@ def main():
 
     if os.getenv("ORT_BUILD_WITH_CACHE") == "1":
         args.use_cache = True
+
+    # VCPKG's scripts/toolchains/android.cmake has logic for autodetecting NDK home when the ANDROID_NDK_HOME env is not set, but it is only implemented for Windows
+    if args.android and args.use_vcpkg and args.android_ndk_path is not None and os.path.exists(args.android_ndk_path):
+        os.environ["ANDROID_NDK_HOME"] = args.android_ndk_path
 
     if not is_windows():
         if not args.allow_running_as_root:
