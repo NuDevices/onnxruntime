@@ -5,11 +5,12 @@ endif()
 vcpkg_from_github(
     OUT_SOURCE_PATH SOURCE_PATH
     REPO google/XNNPACK
-    REF fe98e0b93565382648129271381c14d6205255e3 # 2025-01-14
-    SHA512 7f5c50f894a2d8c633c6b571a9de7b8d78ee7fadfc032e87032cd351260fb315e1bbb30e6fb547a439d565076f15d66c82c29ed3c304f4be2b21c9e3811f0c65
+    REF 854b343f9cad36bd596e4390959ca3648208e048
+    SHA512 f37384b43022cb74bf87bd99c2e82e51d48fe4e0e4642611fcbc10cbb86ff2468b67964027f13f82a715dc7201c490d88d5020fb565ad236187b9dd219f3f644
     HEAD_REF master
     PATCHES
         fix-build.patch
+	disable_gcc_warning.patch
 )
 vcpkg_find_acquire_program(PYTHON3)
 
