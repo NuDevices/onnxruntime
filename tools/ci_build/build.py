@@ -1123,17 +1123,17 @@ def generate_build_tree(
         overlay_triplets_dir = None
         # The enable_address_sanitizer and use_binskim_compliant_compile_flags flags cannot be both enabled
         if args.enable_address_sanitizer:
-            overlay_triplets_dir = os.path.join(source_dir, "cmake", "vcpkg_triplets", "asan")
+            overlay_triplets_dir = os.path.join(source_dir, "cmake", "vcpkg-triplets", "asan")
             if args.disable_rtti:
                 overlay_triplets_dir += "_nortti"
         elif args.use_binskim_compliant_compile_flags:
-            overlay_triplets_dir = os.path.join(source_dir, "cmake", "vcpkg_triplets", "binskim")
+            overlay_triplets_dir = os.path.join(source_dir, "cmake", "vcpkg-triplets", "binskim")
             if args.disable_rtti:
                 overlay_triplets_dir += "_nortti"
         elif args.disable_rtti:
-            overlay_triplets_dir = os.path.join(source_dir, "cmake", "vcpkg_triplets", "nortti")
+            overlay_triplets_dir = os.path.join(source_dir, "cmake", "vcpkg-triplets", "nortti")
         if overlay_triplets_dir is None:
-            overlay_triplets_dir = os.path.join(source_dir, "cmake", "vcpkg_triplets", "default")
+            overlay_triplets_dir = os.path.join(source_dir, "cmake", "vcpkg-triplets", "default")
         vcpkg_install_options.append(f"--overlay-triplets={overlay_triplets_dir}")
 
         # VCPKG_INSTALL_OPTIONS is a CMake list. It must be joined by semicolons
