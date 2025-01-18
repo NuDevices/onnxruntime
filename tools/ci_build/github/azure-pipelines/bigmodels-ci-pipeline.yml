@@ -108,7 +108,7 @@ stages:
             -e BUILD_BUILDNUMBER \
             -e CCACHE_DIR=/cache \
             $(Repository) \
-            /bin/bash -c "
+            /bin/bash -c '
               set -ex; \
               env; \
               ccache -s; \
@@ -125,7 +125,7 @@ stages:
                 --use_cache \
                 --cmake_extra_defines  'CMAKE_CUDA_ARCHITECTURES=75;86' ; \
                 ccache -sv; \
-                ccache -z"
+                ccache -z'
         workingDirectory: $(Build.SourcesDirectory)
 
     - task: CmdLine@2
