@@ -7,7 +7,7 @@ onnxruntime_fetchcontent_declare(
 )
 
 set(CUDNN_FRONTEND_BUILD_SAMPLES OFF CACHE BOOL "" FORCE)
-set(CUDNN_FRONTEND_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(CUDNN_FRONTEND_BUILD_UNIT_TESTS OFF CACHE BOOL "" FORCE)
 set(CUDNN_FRONTEND_BUILD_PYTHON_BINDINGS OFF CACHE BOOL "" FORCE)
 set(CUDNN_PATH ${onnxruntime_CUDNN_HOME})
 onnxruntime_fetchcontent_makeavailable(cudnn_frontend)
