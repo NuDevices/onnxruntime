@@ -682,7 +682,6 @@ if (onnxruntime_USE_WEBGPU)
 endif()
 
 set(onnxruntime_LINK_DIRS)
-
 if (onnxruntime_USE_CUDA)
   find_package(CUDAToolkit REQUIRED)
 
