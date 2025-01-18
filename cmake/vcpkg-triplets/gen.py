@@ -92,7 +92,7 @@ for enable_rtti in [True, False]:
                             f.write('set(VCPKG_C_FLAGS "{}")\n'.format(" ".join(cflags)))
                         if len(cxxflags) >= 1:
                             f.write('set(VCPKG_CXX_FLAGS "{}")\n'.format(" ".join(cxxflags)))
-                        f.write("list(APPEND VCPKG_CMAKE_CONFIGURE_OPTIONS --compile-no-warning-as-error -DVCPKG_CMAKE_CONFIGURE_OPTIONS=17)\n")
+                        f.write("list(APPEND VCPKG_CMAKE_CONFIGURE_OPTIONS --compile-no-warning-as-error -DCMAKE_CXX_STANDARD=17)\n")
                         if ldflags:
                             f.write('set(VCPKG_LINKER_FLAGS "{}")\n'.format(" ".join(ldflags)))
                         add_port_configs(f)
