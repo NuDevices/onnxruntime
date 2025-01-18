@@ -35,10 +35,7 @@
     },
     "ms-gsl",
     "nlohmann-json",
-    {
-      "name": "onnx",
-      "version>=": "1.16.2"
-    },
+    "onnx",
     "optional-lite",
     {
       "name": "protobuf",
