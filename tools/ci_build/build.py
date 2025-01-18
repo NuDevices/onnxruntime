@@ -2610,6 +2610,9 @@ def main():
     if args.build_wasm:
         # No custom triplet for the wasm builds yet
         args.use_vcpkg = False
+    elif args.minimal_build:
+        # Minimal build uses a custom ONNX cmake file. Don't know how to deal with it yet
+        args.use_vcpkg = False
     elif args.ios or args.android:
         args.use_vcpkg = False
 
