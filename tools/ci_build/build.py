@@ -2607,7 +2607,7 @@ def main():
 
     print(args)
 
-    if args.build_wasm:
+    if args.build_wasm or args.use_webgpu:
         # No custom triplet for the wasm builds yet
         args.use_vcpkg = False
     elif args.minimal_build:
