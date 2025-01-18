@@ -2619,6 +2619,9 @@ def main():
         args.use_vcpkg = False
     elif args.ios:
         args.use_vcpkg = False
+    elif args.use_extensions:
+        # ORT extension no longer supports combined build, except for WASM. Due to dependency version conflicts
+        args.use_vcpkg = False
 
     if os.getenv("ORT_BUILD_WITH_CACHE") == "1":
         args.use_cache = True
