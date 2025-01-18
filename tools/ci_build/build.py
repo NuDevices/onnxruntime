@@ -1947,7 +1947,12 @@ def run_android_tests(args, source_dir, build_dir, config, cwd):
             context_stack.callback(android.stop_emulator, emulator_proc)
 
         adb_push("testdata", device_dir, cwd=cwd)
-        adb_push(os.path.join(source_dir, "cmake", "external", "onnx", "onnx", "backend", "test"), device_dir, cwd=cwd)
+        if is_linux() and os.path.exists("/data/onnx"):
+            adb_push("/data/onnx", device_dir + "/test", cwd=cwd)
+        else:
+            test_data_dir = os.path.join(source_dir, "cmake", "external", "onnx", "onnx", "backend", "test")
+            if os.path.exists(test_data_dir):
+                adb_push(test_data_dir, device_dir + "/test", cwd=cwd)
         adb_push("onnxruntime_test_all", device_dir, cwd=cwd)
         adb_shell(f"chmod +x {device_dir}/onnxruntime_test_all")
         adb_push("onnx_test_runner", device_dir, cwd=cwd)
@@ -2613,7 +2618,7 @@ def main():
     elif args.minimal_build:
         # Minimal build uses a custom ONNX cmake file. Don't know how to deal with it yet
         args.use_vcpkg = False
-    elif args.ios or args.android:
+    elif args.ios:
         args.use_vcpkg = False
 
     if os.getenv("ORT_BUILD_WITH_CACHE") == "1":
