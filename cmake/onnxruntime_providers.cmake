@@ -119,6 +119,9 @@ endif()
 if (onnxruntime_USE_AZURE)
   set(PROVIDERS_AZURE onnxruntime_providers_azure)
 endif()
+if(onnxruntime_USE_NUDGEV)
+  set(PROVIDERS_NUDGEV onnxruntime_providers_nudgev)
+endif()
 
 
 if(onnxruntime_USE_SNPE)
@@ -212,4 +215,7 @@ endif()
 
 if (onnxruntime_USE_AZURE)
   include(onnxruntime_providers_azure.cmake)
+endif()
+if (onnxruntime_USE_NUDGEV)
+  include(onnxruntime_providers_nudgev.cmake)
 endif()
