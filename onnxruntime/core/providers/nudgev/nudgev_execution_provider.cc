@@ -2,10 +2,9 @@
 #include "core/providers/nudgev/nudgev_matmul.h"
 #include "core/framework/compute_capability.h"
 #include "core/framework/kernel_registry.h"
+#include "core/framework/op_kernel.h"
 
 namespace onnxruntime {
-
-static constexpr const char* kNudgevExecutionProvider = "Nudgev";
 
 static void RegisterNudgevKernels(KernelRegistry& kernel_registry) {
   KernelDefBuilder def_builder;
@@ -27,8 +26,9 @@ static void RegisterNudgevKernels(KernelRegistry& kernel_registry) {
   ORT_ENFORCE(status.IsOK(), "Failed to register NUDGEV kernel for MatMul");
 }
 
+// costruttore
 NudgevExecutionProvider::NudgevExecutionProvider(const std::string& device_id)
-    : IExecutionProvider(kNudgevExecutionProvider) {
+    : IExecutionProvider{kNudgevExecutionProvider} {
   ORT_UNUSED_PARAMETER(device_id);
 }
 
@@ -42,16 +42,14 @@ std::shared_ptr<KernelRegistry> NudgevExecutionProvider::GetKernelRegistry() con
 }
 
 std::vector<std::unique_ptr<ComputeCapability>>
-NudgevExecutionProvider::GetCapability(
-    const onnxruntime::GraphViewer& graph_viewer,
-    const IKernelLookup& kernel_lookup) const {
+NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
+                                       const IKernelLookup& kernel_lookup) const {
   ORT_UNUSED_PARAMETER(kernel_lookup);
 
   std::vector<std::unique_ptr<ComputeCapability>> result;
 
   for (auto& node : graph_viewer.Nodes()) {
     if (node.OpType() == "MatMul") {
-      // Check if all inputs are int8
       bool all_inputs_int8 = true;
       for (const auto* input : node.InputDefs()) {
         if (input->Type() == nullptr ||
@@ -72,17 +70,13 @@ NudgevExecutionProvider::GetCapability(
   return result;
 }
 
-Status NudgevExecutionProvider::Compile(
-    const std::vector<FusedNodeAndGraph>& fused_nodes_and_graphs,
-    std::vector<NodeComputeInfo>& node_compute_funcs) {
-
+Status NudgevExecutionProvider::Compile(const std::vector<FusedNodeAndGraph>& fused_nodes_and_graphs,
+                                        std::vector<NodeComputeInfo>& node_compute_funcs) {
   for (auto& fused_node : fused_nodes_and_graphs) {
     ORT_UNUSED_PARAMETER(fused_node);
 
     NodeComputeInfo compute_info;
-    compute_info.compute_func = [](FunctionState state,
-                                 const OrtApi* api,
-                                 OrtKernelContext* context) -> Status {
+    compute_info.compute_func = [](FunctionState state, const OrtApi* api, OrtKernelContext* context) -> Status {
       ORT_UNUSED_PARAMETER(state);
       ORT_UNUSED_PARAMETER(api);
       ORT_UNUSED_PARAMETER(context);

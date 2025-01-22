@@ -15,7 +15,7 @@ Status NudgevMatMul::Compute(OpKernelContext* context) const {
   if (A->DataType() != DataTypeImpl::GetType<int8_t>() ||
       B->DataType() != DataTypeImpl::GetType<int8_t>()) {
     return Status(common::ONNXRUNTIME, common::INVALID_ARGUMENT,
-                 "Nudgev MatMul only supports INT8 inputs");
+                  "Nudgev MatMul only supports INT8 inputs");
   }
 
   // Use MatMulHelper to handle broadcasting and shape inference
