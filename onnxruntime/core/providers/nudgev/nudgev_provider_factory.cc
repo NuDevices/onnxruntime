@@ -1,35 +1,47 @@
 #include "core/providers/nudgev/nudgev_provider_factory_creator.h"
 #include "core/providers/nudgev/nudgev_execution_provider.h"
 #include "core/session/abi_session_options_impl.h"
-#include "core/session/onnxruntime_session_options_config_keys.h"
 #include "core/session/onnxruntime_c_api.h"
+#include "core/framework/provider_options.h"
+#include "core/session/inference_session.h"
 
 namespace onnxruntime {
 
-namespace {
 struct NudgevProviderFactory : IExecutionProviderFactory {
-  explicit NudgevProviderFactory(const std::string& device_id)
-      : device_id_(device_id) {}
+  NudgevProviderFactory(const ProviderOptions& provider_options_map,
+                        const SessionOptions* session_options)
+      : provider_options_map_(provider_options_map),
+        session_options_(session_options) {}
 
   ~NudgevProviderFactory() override = default;
+
   std::unique_ptr<IExecutionProvider> CreateProvider() override {
-    return std::make_unique<NudgevExecutionProvider>(device_id_);
+    return std::make_unique<NudgevExecutionProvider>(provider_options_map_,
+                                                     session_options_);
   }
 
  private:
-  std::string device_id_;
+  ProviderOptions provider_options_map_;
+  const SessionOptions* session_options_;
 };
-}  // namespace
 
-std::shared_ptr<IExecutionProviderFactory> NudgevProviderFactoryCreator::Create(const std::string& device_id) {
-  return std::make_shared<NudgevProviderFactory>(device_id);
+std::shared_ptr<IExecutionProviderFactory>
+NudgevProviderFactoryCreator::Create(const ProviderOptions& provider_options_map,
+                                     const SessionOptions* session_options) {
+  return std::make_shared<NudgevProviderFactory>(provider_options_map,
+                                                 session_options);
 }
 
 }  // namespace onnxruntime
 
-ORT_API_STATUS_IMPL(OrtSessionOptionsAppendExecutionProvider_Nudgev, _In_ OrtSessionOptions* options, const char* device_id) {
-  std::string device_id_str = (device_id ? device_id : "");
-  auto factory = onnxruntime::NudgevProviderFactoryCreator::Create(device_id_str);
+ORT_API_STATUS_IMPL(OrtSessionOptionsAppendExecutionProvider_Nudgev,
+                    _In_ OrtSessionOptions* options,
+                    _In_opt_ const char* device_id) {
+  auto factory = onnxruntime::NudgevProviderFactoryCreator::Create(
+      onnxruntime::ProviderOptions{{"device_id", ""}},
+      reinterpret_cast<const onnxruntime::SessionOptions*>(options));
+
   options->provider_factories.push_back(factory);
+
   return nullptr;
 }

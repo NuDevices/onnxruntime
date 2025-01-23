@@ -3,27 +3,29 @@
 
 add_definitions(-DUSE_NUDGEV=1)
 
+# Add shared utils
+file(GLOB onnxruntime_providers_shared_utils_cc_srcs CONFIGURE_DEPENDS
+  "${ONNXRUNTIME_ROOT}/core/providers/shared/utils/utils.h"
+  "${ONNXRUNTIME_ROOT}/core/providers/shared/utils/utils.cc"
+)
+
 # Gather all source files
-file(GLOB_RECURSE
+file(GLOB_RECURSE 
   onnxruntime_providers_nudgev_cc_srcs CONFIGURE_DEPENDS
   "${ONNXRUNTIME_ROOT}/core/providers/nudgev/*.h"
   "${ONNXRUNTIME_ROOT}/core/providers/nudgev/*.cc"
 )
 
-if (onnxruntime_BUILD_UNIT_TESTS)
-  if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    # Disable the uninitialized warning for tests
-    set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/test/providers/cpu/ml/write_scores_test.cc
-      PROPERTIES
-      COMPILE_FLAGS "-Wno-error=maybe-uninitialized"
-    )
-  endif()
-endif()
+# Combine all sources
+set(onnxruntime_providers_nudgev_all_srcs
+  ${onnxruntime_providers_shared_utils_cc_srcs}
+  ${onnxruntime_providers_nudgev_cc_srcs}
+)
 
-source_group(TREE ${ONNXRUNTIME_ROOT}/core FILES ${onnxruntime_providers_nudgev_cc_srcs})
+source_group(TREE ${ONNXRUNTIME_ROOT}/core FILES ${onnxruntime_providers_nudgev_all_srcs})
 
 # Create the provider library
-onnxruntime_add_static_library(onnxruntime_providers_nudgev ${onnxruntime_providers_nudgev_cc_srcs})
+onnxruntime_add_static_library(onnxruntime_providers_nudgev ${onnxruntime_providers_nudgev_all_srcs})
 
 # Add include dependencies
 onnxruntime_add_include_to_target(onnxruntime_providers_nudgev
@@ -40,11 +42,15 @@ add_dependencies(onnxruntime_providers_nudgev onnx ${onnxruntime_EXTERNAL_DEPEND
 
 # Set properties
 set_target_properties(onnxruntime_providers_nudgev PROPERTIES FOLDER "ONNXRuntime")
-target_include_directories(onnxruntime_providers_nudgev PRIVATE ${ONNXRUNTIME_ROOT})
+
+# Include directories
 target_include_directories(onnxruntime_providers_nudgev PRIVATE
   ${ONNXRUNTIME_ROOT}
+  ${ONNXRUNTIME_ROOT}/core/optimizer/qdq_transformer
+  ${ONNXRUNTIME_ROOT}/core/optimizer/qdq_transformer/selectors_actions
   ${eigen_SOURCE_DIR}
 )
+
 set_target_properties(onnxruntime_providers_nudgev PROPERTIES LINKER_LANGUAGE CXX)
 
 # Installation rules if building static library

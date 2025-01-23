@@ -181,6 +181,7 @@ target_link_libraries(onnxruntime_pybind11_state PRIVATE
     ${PROVIDERS_WEBGPU}
     ${PROVIDERS_AZURE}
     ${PROVIDERS_QNN}
+    ${PROVIDERS_NUDGEV}
     onnxruntime_optimizer
     onnxruntime_providers
     onnxruntime_util

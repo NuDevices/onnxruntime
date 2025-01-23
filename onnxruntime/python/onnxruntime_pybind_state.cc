@@ -1261,6 +1261,14 @@ std::unique_ptr<IExecutionProvider> CreateExecutionProviderInstance(
                cit == provider_options_map.end() ? ProviderOptions{} : cit->second, &session_options)
         ->CreateProvider();
 #endif
+  } else if (type == kNudgevExecutionProvider) {
+#ifdef USE_NUDGEV
+    auto it = provider_options_map.find(type);
+    ProviderOptions provider_options = it != provider_options_map.end() ? it->second : ProviderOptions{};
+    return onnxruntime::NudgevProviderFactoryCreator::Create(provider_options, &session_options)->CreateProvider();
+#else
+    throw std::runtime_error("NudgevExecutionProvider is not enabled in this build.");
+#endif
   } else {
     // check whether it is a dynamic load EP:
     const auto it = provider_options_map.find(type);

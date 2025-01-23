@@ -1,17 +1,19 @@
 #pragma once
 
-#include "core/framework/execution_provider.h"
+#include <memory>
+#include <string>
+#include "core/framework/provider_options.h"
+#include "core/session/onnxruntime_c_api.h"
 #include "core/providers/providers.h"
 
 namespace onnxruntime {
 
-// Forward declare the factory function
-IExecutionProviderFactory* CreateExecutionProviderFactory_Nudgev(const std::string& device_id = "");
+struct SessionOptions;
 
 struct NudgevProviderFactoryCreator {
-  static IExecutionProviderFactory* Create() {
-    return CreateExecutionProviderFactory_Nudgev();
-  }
+  static std::shared_ptr<IExecutionProviderFactory> Create(
+      const ProviderOptions& provider_options_map,
+      const SessionOptions* session_options = nullptr);
 };
 
 }  // namespace onnxruntime
