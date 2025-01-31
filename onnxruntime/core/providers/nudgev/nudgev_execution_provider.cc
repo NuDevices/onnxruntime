@@ -15,7 +15,6 @@
 #include <chrono>
 #include <iostream>
 #include <immintrin.h>
-#include <cnpy.h>
 
 namespace onnxruntime {
 
@@ -219,7 +218,7 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
       continue;
     }
 
-    // Weight parameters (DequantizeLinear) - Moving this up since we need dimensions early
+    // Weight parameters (DequantizeLinear)
     const Node* weight_dq = graph_viewer.GetProducerNode(node->InputDefs()[1]->Name());
     if (!weight_dq || weight_dq->OpType() != "DequantizeLinear" ||
         handled_nodes.find(weight_dq) != handled_nodes.end()) {
@@ -397,7 +396,7 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
     }
 
     float M = params.input_scale * params.weight_scale / params.output_scale;
-    params.M_fixed = static_cast<int32_t>(std::round(M * (1 << 15)));
+    params.M_fixed = static_cast<int32_t>(M * (1 << 15));
     params.M = params.input_scale * params.weight_scale / params.output_scale;
 
     // Added node names for debugging
@@ -514,7 +513,7 @@ Status NudgevExecutionProvider::Compile(
 
       auto start = std::chrono::high_resolution_clock::now();
       // Im2row computation phase
-      /*
+
       im2row(input_data,
              im2row_data,
              batch_size,
@@ -526,8 +525,7 @@ Status NudgevExecutionProvider::Compile(
              params->strides[0],
              params->pads,
              params->input_zp);
-      */
-
+      /*
       std::vector<int32_t> input_dequantized(batch_size * input_channels * input_height * input_width);
       for (size_t i = 0; i < input_dequantized.size(); i++) {
         input_dequantized[i] = static_cast<int32_t>(input_data[i]) - params->input_zp;
@@ -557,10 +555,9 @@ Status NudgevExecutionProvider::Compile(
           }
         }
       }
-
+      */
       auto end = std::chrono::high_resolution_clock::now();
       auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-
       /*
       std::cout << "=== Conv Op - Im2Row Debug Info ===\n";
       std::cout << "Input Shape: (" << batch_size << ", " << input_channels << ", "
@@ -571,7 +568,7 @@ Status NudgevExecutionProvider::Compile(
       std::cout << "Stride: (" << params->strides[0] << ", " << params->strides[1] << ")\n";
       std::cout << "Padding: (" << params->pads[0] << ", " << params->pads[1] << ")\n";
       std::cout << "Output Shape: (" << batch_size << ", " << output_channels << ", "
-                << output_height << ", " << output_width << ")\n";
+                << params->output_height << ", " << params->output_width << ")\n";
       std::cout << "Conv Op - Im2row execution time: " << duration.count() << " microseconds" << std::endl;
       std::cout << "====================================\n";
       */

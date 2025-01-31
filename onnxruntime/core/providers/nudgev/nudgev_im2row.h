@@ -67,7 +67,7 @@ void im2row(
   }
   auto end = std::chrono::high_resolution_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-  std::cout << "Conversion time: " << duration.count() << " microseconds" << std::endl;
+  // std::cout << "Conversion time: " << duration.count() << " microseconds" << std::endl;
 
   std::vector<int32_t> input_padded;
   int64_t padded_height = height;
