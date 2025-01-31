@@ -6,33 +6,73 @@
 #include "core/session/onnxruntime_session_options_config_keys.h"
 #include "core/framework/provider_options.h"
 #include "core/framework/data_transfer_manager.h"
-#include "core/providers/nudgev/nudgev_conv.h"
 #include <unordered_map>
+#include <immintrin.h>
 #include <vector>
 #include <string>
 
 namespace onnxruntime {
 
-struct ConvQuantParams {
-  float input_scale;
-  int8_t input_zp;
-  float weight_scale;
-  int8_t weight_zp;
-  float bias_scale;
-  int8_t bias_zp;
-  float output_scale;
-  int8_t output_zp;
+struct alignas(32) ConvQuantParams {
+  float input_scale{};
+  int8_t input_zp{};
+  float weight_scale{};
+  int8_t weight_zp{};
+  float bias_scale{};
+  int8_t bias_zp{};
+  float output_scale{};
+  int8_t output_zp{};
+
+  int64_t group{};
+  bool has_bias{};
+  bool fused_relu{};
+  float M{};
+  int32_t M_fixed{};
+  int64_t N{};
+  int64_t K{};
+  int64_t output_height{};
+  int64_t output_width{};
+  int64_t batch_size{};
+
   std::vector<int64_t> strides;
   std::vector<int64_t> pads;
   std::vector<int64_t> dilations;
-  int64_t group;
-  std::string auto_pad;
-  bool has_bias;
-  bool fused_relu;
-  std::vector<int8_t> weights;
-  std::vector<int32_t> bias;
   std::vector<int64_t> weight_shape;
   std::vector<int64_t> bias_shape;
+  std::string auto_pad;
+  std::string node_name;
+
+  alignas(32) std::vector<int8_t> weights;
+  alignas(32) std::vector<int32_t> bias;
+  alignas(32) std::vector<int32_t> im2row_buffer;
+  alignas(32) std::vector<int8_t> temp_buffer;
+
+  Status initialize_buffers(const std::vector<int64_t>& weight_shape_,
+                            const std::vector<int64_t>& bias_shape_,
+                            int64_t batch_size_, int64_t output_height_,
+                            int64_t output_width_) {
+    weight_shape = weight_shape_;
+    bias_shape = bias_shape_;
+    batch_size = batch_size_;
+    output_height = output_height_;
+    output_width = output_width_;
+    const int64_t OC = weight_shape[0];
+    const int64_t IC = weight_shape[1];
+    const int64_t KH = weight_shape[2];
+    const int64_t KW = weight_shape[3];
+
+    const size_t K = IC * KH * KW;
+    const size_t N = batch_size * output_height * output_width;
+
+    weights.resize(K * OC);
+    im2row_buffer.resize(N * K);
+
+    if (!bias_shape.empty()) {
+      bias.resize(bias_shape[0]);
+    }
+
+    return Status::OK();
+  }
 };
 
 class Memcpy final : public OpKernel {
@@ -42,10 +82,10 @@ class Memcpy final : public OpKernel {
   Status Compute(OpKernelContext* ctx) const override {
     const auto* X = ctx->Input<Tensor>(0);
     ORT_ENFORCE(X != nullptr, "Memcpy: Input tensor is nullptr.");
-    std::cout << "[Memcpy Kernel] Input tensor shape: " << X->Shape().ToString() << std::endl;
+    // std::cout << "[Memcpy Kernel] Input tensor shape: " << X->Shape().ToString() << std::endl;
     Tensor* Y = ctx->Output(0, X->Shape());
     ORT_ENFORCE(Y != nullptr, "Memcpy: Failed to allocate output tensor.");
-    std::cout << "[Memcpy Kernel] Output tensor shape: " << Y->Shape().ToString() << std::endl;
+    // std::cout << "[Memcpy Kernel] Output tensor shape: " << Y->Shape().ToString() << std::endl;
     memcpy(Y->MutableDataRaw(), X->DataRaw(), X->SizeInBytes());
 
     return Status::OK();

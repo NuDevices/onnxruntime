@@ -37,6 +37,7 @@ NudgevProviderFactoryCreator::Create(const ProviderOptions& provider_options_map
 ORT_API_STATUS_IMPL(OrtSessionOptionsAppendExecutionProvider_Nudgev,
                     _In_ OrtSessionOptions* options,
                     _In_opt_ const char* device_id) {
+  ORT_UNUSED_PARAMETER(device_id);
   auto factory = onnxruntime::NudgevProviderFactoryCreator::Create(
       onnxruntime::ProviderOptions{{"device_id", ""}},
       reinterpret_cast<const onnxruntime::SessionOptions*>(options));

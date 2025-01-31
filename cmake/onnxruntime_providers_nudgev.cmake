@@ -10,8 +10,8 @@ file(GLOB onnxruntime_providers_shared_utils_cc_srcs CONFIGURE_DEPENDS
 )
 
 # Gather all source files
-file(GLOB_RECURSE 
-  onnxruntime_providers_nudgev_cc_srcs CONFIGURE_DEPENDS
+file(GLOB_RECURSE
+   onnxruntime_providers_nudgev_cc_srcs CONFIGURE_DEPENDS
   "${ONNXRUNTIME_ROOT}/core/providers/nudgev/*.h"
   "${ONNXRUNTIME_ROOT}/core/providers/nudgev/*.cc"
 )
@@ -26,6 +26,18 @@ source_group(TREE ${ONNXRUNTIME_ROOT}/core FILES ${onnxruntime_providers_nudgev_
 
 # Create the provider library
 onnxruntime_add_static_library(onnxruntime_providers_nudgev ${onnxruntime_providers_nudgev_all_srcs})
+
+# Add AVX2 compilation flags
+if(MSVC)
+    target_compile_options(onnxruntime_providers_nudgev PRIVATE
+        /arch:AVX2
+    )
+else()
+    target_compile_options(onnxruntime_providers_nudgev PRIVATE
+        -mavx2
+        -mfma
+    )
+endif()
 
 # Add include dependencies
 onnxruntime_add_include_to_target(onnxruntime_providers_nudgev
