@@ -44,8 +44,10 @@ struct alignas(32) ConvQuantParams {
 
   alignas(32) std::vector<int8_t> weights;
   alignas(32) std::vector<int32_t> bias;
-  alignas(32) std::vector<int32_t> im2row_buffer;
+  alignas(32) std::vector<int8_t> im2row_buffer;
   alignas(32) std::vector<int8_t> temp_buffer;
+  alignas(32) std::vector<int8_t> input_centered_buffer;
+  alignas(32) std::vector<int8_t> padded_buffer;
 
   Status initialize_buffers(const std::vector<int64_t>& weight_shape_,
                             const std::vector<int64_t>& bias_shape_,

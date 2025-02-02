@@ -16,6 +16,9 @@
 #include <iostream>
 #include <immintrin.h>
 
+#include "core/platform/threadpool.h"
+#include "core/platform/ort_mutex.h"
+
 namespace onnxruntime {
 
 static void RegisterNudgevKernels(KernelRegistry& kernel_registry) {
@@ -140,7 +143,6 @@ std::shared_ptr<KernelRegistry> NudgevExecutionProvider::GetKernelRegistry() con
 }
 
 DataLayout NudgevExecutionProvider::GetPreferredLayout() const {
-  // return DataLayout::NHWC;
   return DataLayout::NCHW;
 }
 
@@ -249,11 +251,17 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
     params.output_width = static_cast<int64_t>(std::floor(
         (input_width + params.pads[1] + params.pads[3] - KW) / static_cast<double>(params.strides[1]) + 1));
 
+    const int64_t max_padded_height = input_height + params.pads[0] + params.pads[2];
+    const int64_t max_padded_width = input_width + params.pads[1] + params.pads[3];
+
     params.N = batch_size * params.output_height * params.output_width;
     params.K = input_channels * KH * KW;
     const size_t buffer_size = params.N * params.K;
     const size_t temp_buffer_size = params.N * OC;
-    params.im2row_buffer.resize(buffer_size);
+    const size_t input_size = batch_size * input_channels * input_height * input_width;
+    const size_t padded_input = batch_size * input_channels * max_padded_height * max_padded_width;
+    params.padded_buffer.resize(padded_input);
+    params.input_centered_buffer.resize(input_size);
     params.temp_buffer.resize(temp_buffer_size);
 
     const auto& input_qparams = input_dq->InputDefs();
@@ -478,11 +486,10 @@ Status NudgevExecutionProvider::Compile(
         return Status(common::ONNXRUNTIME, common::FAIL, "pads is empty");
       }
       auto* ctx_internal = reinterpret_cast<OpKernelContextInternal*>(context);
-
+      concurrency::ThreadPool* tp = ctx_internal->GetOperatorThreadPool();
       // Get input tensor
       const Tensor* input = ctx_internal->Input<Tensor>(0);
       if (!input) return Status(common::ONNXRUNTIME, common::FAIL, "input tensor is null");
-
       // Get input shapes
       const auto& input_shape = input->Shape();
       const int64_t batch_size = input_shape[0];
@@ -509,13 +516,11 @@ Status NudgevExecutionProvider::Compile(
       // Get data pointers
       const auto* input_data = input->Data<int8_t>();
       auto* output_data = Y->MutableData<int8_t>();
-      int32_t* im2row_data = params->im2row_buffer.data();
+      int8_t* im2row_data = params->im2row_buffer.data();
 
       auto start = std::chrono::high_resolution_clock::now();
-      // Im2row computation phase
-
       im2row(input_data,
-             im2row_data,
+             params->im2row_buffer.data(),
              batch_size,
              input_channels,
              input_height,
@@ -524,41 +529,14 @@ Status NudgevExecutionProvider::Compile(
              kernel_width,
              params->strides[0],
              params->pads,
-             params->input_zp);
-      /*
-      std::vector<int32_t> input_dequantized(batch_size * input_channels * input_height * input_width);
-      for (size_t i = 0; i < input_dequantized.size(); i++) {
-        input_dequantized[i] = static_cast<int32_t>(input_data[i]) - params->input_zp;
-      }
+             params->input_zp,
+             params->input_centered_buffer.data(),
+             params->padded_buffer.data(),
+             tp);
 
-      for (int64_t n = 0; n < N; n++) {
-        const int64_t b = n / (params->output_height * params->output_width);
-        const int64_t oh = (n / params->output_width) % params->output_height;
-        const int64_t ow = n % params->output_width;
-        const int64_t row_idx = n * K;
-
-        for (int64_t ic = 0; ic < input_channels; ic++) {
-          for (int64_t kh = 0; kh < kernel_height; kh++) {
-            for (int64_t kw = 0; kw < kernel_width; kw++) {
-              const int64_t ih = oh * params->strides[0] - params->pads[0] + kh;
-              const int64_t iw = ow * params->strides[1] - params->pads[1] + kw;
-              const int64_t k = (ic * kernel_height * kernel_width) + (kh * kernel_width) + kw;
-              const int64_t col_idx = row_idx + k;
-
-              if (ih < 0 || ih >= input_height || iw < 0 || iw >= input_width) {
-                im2row_data[col_idx] = 0;
-              } else {
-                const int64_t input_idx = ((b * input_channels + ic) * input_height + ih) * input_width + iw;
-                im2row_data[col_idx] = input_dequantized[input_idx];
-              }
-            }
-          }
-        }
-      }
-      */
       auto end = std::chrono::high_resolution_clock::now();
       auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-      /*
+
       std::cout << "=== Conv Op - Im2Row Debug Info ===\n";
       std::cout << "Input Shape: (" << batch_size << ", " << input_channels << ", "
                 << input_height << ", " << input_width << ")\n";
@@ -571,7 +549,7 @@ Status NudgevExecutionProvider::Compile(
                 << params->output_height << ", " << params->output_width << ")\n";
       std::cout << "Conv Op - Im2row execution time: " << duration.count() << " microseconds" << std::endl;
       std::cout << "====================================\n";
-      */
+
       // GEMM computation phase
       for (int32_t n = 0; n < N; ++n) {
         for (int32_t m = 0; m < output_channels; ++m) {
