@@ -26,6 +26,7 @@ struct alignas(32) ConvQuantParams {
   int64_t group{};
   bool has_bias{};
   bool fused_relu{};
+  bool dynamic_batch{};
   float M{};
   int32_t M_fixed{};
   int64_t N{};

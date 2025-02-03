@@ -157,6 +157,7 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
   }
 
   const auto& initializers = graph_viewer.GetAllInitializedTensors();
+  std::cout << "Got initializers, size: " << initializers.size() << std::endl;
 
   for (const NodeIndex node_index : graph_viewer.GetNodesInTopologicalOrder()) {
     const Node* node = graph_viewer.GetNode(node_index);
@@ -167,6 +168,7 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
     }
 
     ConvQuantParams params{};
+    std::cout << "Created ConvQuantParams" << std::endl;
 
     const auto& attributes = node->GetAttributes();
 
@@ -230,8 +232,6 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
     // Get weights dimensions first
     const auto* weight_tensor = initializers.at(weight_dq->InputDefs()[0]->Name());
     const auto& weight_dims = weight_tensor->dims();
-
-    // Assegniamo le dimensioni ai parametri
     const int64_t OC = weight_dims[0];
     const int64_t IC = weight_dims[1];
     const int64_t KH = weight_dims[2];
@@ -239,7 +239,7 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
 
     // Get input shape
     const auto* shape_proto = input_dq->InputDefs()[0]->Shape();
-    const int64_t batch_size = shape_proto->dim(0).dim_value();
+    const int64_t initial_batch_size = shape_proto->dim(0).dim_value();
     const int64_t input_channels = shape_proto->dim(1).dim_value();
     const int64_t input_height = shape_proto->dim(2).dim_value();
     const int64_t input_width = shape_proto->dim(3).dim_value();
@@ -254,12 +254,18 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
     const int64_t max_padded_height = input_height + params.pads[0] + params.pads[2];
     const int64_t max_padded_width = input_width + params.pads[1] + params.pads[3];
 
-    params.N = batch_size * params.output_height * params.output_width;
+    int64_t effective_batch_size = initial_batch_size;
+    if (initial_batch_size == 0) {
+      effective_batch_size = 16;
+      params.dynamic_batch = true;
+    }
+
+    params.N = effective_batch_size * params.output_height * params.output_width;
     params.K = input_channels * KH * KW;
     const size_t buffer_size = params.N * params.K;
     const size_t temp_buffer_size = params.N * OC;
-    const size_t input_size = batch_size * input_channels * input_height * input_width;
-    const size_t padded_input = batch_size * input_channels * max_padded_height * max_padded_width;
+    const size_t input_size = effective_batch_size * input_channels * input_height * input_width;
+    const size_t padded_input = effective_batch_size * input_channels * max_padded_height * max_padded_width;
     params.padded_buffer.resize(padded_input);
     params.input_centered_buffer.resize(input_size);
     params.temp_buffer.resize(temp_buffer_size);
@@ -270,7 +276,7 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
     Status status = params.initialize_buffers(
         {OC, IC, KH, KW},
         params.has_bias ? std::vector<int64_t>{OC} : std::vector<int64_t>{},
-        batch_size,
+        effective_batch_size,
         params.output_height,
         params.output_width);
 
@@ -469,11 +475,10 @@ Status NudgevExecutionProvider::Compile(
       }
 
       auto* params = static_cast<ConvQuantParams*>(state);
-      const int64_t K = params->K;
-      const int64_t N = params->N;
       if (!params) {
         return Status(common::ONNXRUNTIME, common::FAIL, "params cast failed");
       }
+
       if (params->weight_shape.empty()) {
         return Status(common::ONNXRUNTIME, common::FAIL, "weight_shape is empty");
       }
@@ -485,23 +490,49 @@ Status NudgevExecutionProvider::Compile(
       if (params->pads.empty()) {
         return Status(common::ONNXRUNTIME, common::FAIL, "pads is empty");
       }
+
       auto* ctx_internal = reinterpret_cast<OpKernelContextInternal*>(context);
       concurrency::ThreadPool* tp = ctx_internal->GetOperatorThreadPool();
+
       // Get input tensor
       const Tensor* input = ctx_internal->Input<Tensor>(0);
       if (!input) return Status(common::ONNXRUNTIME, common::FAIL, "input tensor is null");
+
       // Get input shapes
       const auto& input_shape = input->Shape();
-      const int64_t batch_size = input_shape[0];
+      const int64_t actual_batch_size = input_shape[0];
       const int64_t input_channels = input_shape[1];
       const int64_t input_height = input_shape[2];
       const int64_t input_width = input_shape[3];
+
+      // Gestione batch dinamico
+      if (params->dynamic_batch && actual_batch_size != params->batch_size) {
+        std::cout << "Batch size changed from " << params->batch_size << " to " << actual_batch_size
+                  << ". Resizing buffers..." << std::endl;
+
+        const int64_t new_N = actual_batch_size * params->output_height * params->output_width;
+        params->N = new_N;
+
+        const int64_t max_padded_height = input_height + params->pads[0] + params->pads[2];
+        const int64_t max_padded_width = input_width + params->pads[1] + params->pads[3];
+
+        const size_t padded_input = actual_batch_size * input_channels * max_padded_height * max_padded_width;
+        const size_t input_size = actual_batch_size * input_channels * input_height * input_width;
+
+        params->padded_buffer.resize(padded_input);
+        params->input_centered_buffer.resize(input_size);
+        params->im2row_buffer.resize(params->N * params->K);
+        params->temp_buffer.resize(params->N * params->weight_shape[0]);
+
+        params->batch_size = actual_batch_size;
+        std::cout << "Buffer resize completed" << std::endl;
+      }
 
       // Get weight shapes
       const int64_t output_channels = params->weight_shape[0];
       const int64_t kernel_height = params->weight_shape[2];
       const int64_t kernel_width = params->weight_shape[3];
-      std::vector<int64_t> output_shape{batch_size, output_channels, params->output_height, params->output_width};
+      std::vector<int64_t> output_shape{actual_batch_size, output_channels, params->output_height, params->output_width};
 
       Tensor* Y = ctx_internal->Output(0, output_shape);
       if (!Y) {
@@ -521,7 +552,7 @@ Status NudgevExecutionProvider::Compile(
       auto start = std::chrono::high_resolution_clock::now();
       im2row(input_data,
              params->im2row_buffer.data(),
-             batch_size,
+             actual_batch_size,  // Usiamo actual_batch_size invece di params->batch_size
              input_channels,
              input_height,
              input_width,
@@ -538,24 +569,24 @@ Status NudgevExecutionProvider::Compile(
       auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
 
       std::cout << "=== Conv Op - Im2Row Debug Info ===\n";
-      std::cout << "Input Shape: (" << batch_size << ", " << input_channels << ", "
+      std::cout << "Input Shape: (" << actual_batch_size << ", " << input_channels << ", "
                 << input_height << ", " << input_width << ")\n";
       std::cout << "Im2Row Output Shape: [" << params->N << " x " << params->K << "]" << std::endl;
       std::cout << "Weights Shape (2D): [" << params->K << " x " << output_channels << "]" << std::endl;
       std::cout << "Kernel Size: (" << kernel_height << "x" << kernel_width << ")\n";
       std::cout << "Stride: (" << params->strides[0] << ", " << params->strides[1] << ")\n";
       std::cout << "Padding: (" << params->pads[0] << ", " << params->pads[1] << ")\n";
-      std::cout << "Output Shape: (" << batch_size << ", " << output_channels << ", "
+      std::cout << "Output Shape: (" << actual_batch_size << ", " << output_channels << ", "
                 << params->output_height << ", " << params->output_width << ")\n";
       std::cout << "Conv Op - Im2row execution time: " << duration.count() << " microseconds" << std::endl;
       std::cout << "====================================\n";
 
       // GEMM computation phase
-      for (int32_t n = 0; n < N; ++n) {
+      for (int32_t n = 0; n < params->N; ++n) {
         for (int32_t m = 0; m < output_channels; ++m) {
           int64_t acc = 0;
-          for (int32_t k = 0; k < K; ++k) {
-            acc += static_cast<int32_t>(params->weights[k * output_channels + m]) * im2row_data[n * K + k];
+          for (int32_t k = 0; k < params->K; ++k) {
+            acc += static_cast<int32_t>(params->weights[k * output_channels + m]) * im2row_data[n * params->K + k];
           }
 
           if (params->has_bias) {
@@ -575,7 +606,7 @@ Status NudgevExecutionProvider::Compile(
         }
       }
 
-      for (int64_t b = 0; b < batch_size; ++b) {
+      for (int64_t b = 0; b < actual_batch_size; ++b) {
         for (int64_t oc = 0; oc < output_channels; ++oc) {
           for (int64_t oh = 0; oh < params->output_height; ++oh) {
             for (int64_t ow = 0; ow < params->output_width; ++ow) {
