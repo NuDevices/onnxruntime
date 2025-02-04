@@ -168,7 +168,6 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
     }
 
     ConvQuantParams params{};
-    std::cout << "Created ConvQuantParams" << std::endl;
 
     const auto& attributes = node->GetAttributes();
 
@@ -552,7 +551,7 @@ Status NudgevExecutionProvider::Compile(
       auto start = std::chrono::high_resolution_clock::now();
       im2row(input_data,
              params->im2row_buffer.data(),
-             actual_batch_size,  // Usiamo actual_batch_size invece di params->batch_size
+             actual_batch_size,
              input_channels,
              input_height,
              input_width,
@@ -617,7 +616,9 @@ Status NudgevExecutionProvider::Compile(
           }
         }
       }
-
+      auto total_end = std::chrono::high_resolution_clock::now();
+      auto total_duration = std::chrono::duration_cast<std::chrono::microseconds>(total_end - start);
+      std::cout << "Conv Op - Total execution time: " << total_duration.count() << " microseconds" << std::endl;
       return Status::OK();
     };
 
