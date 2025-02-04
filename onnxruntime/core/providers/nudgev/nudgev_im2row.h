@@ -67,102 +67,97 @@ void convert_and_center_saturated(
   }
 }
 
-void im2row_1x1_stride1(
+void im2row_1x1_optimized(
     const int8_t* input,
     int8_t* output,
     int64_t batch_size,
     int64_t channels,
     int64_t height,
     int64_t width,
+    int64_t stride,
     onnxruntime::concurrency::ThreadPool* tp) {
-  const int64_t output_h = height;
-  const int64_t output_w = width;
+  const int64_t output_h = (height - 1) / stride + 1;
+  const int64_t output_w = (width - 1) / stride + 1;
   const int64_t patches_per_image = output_h * output_w;
+
   const int64_t hw_size = height * width;
   const int64_t batch_stride = channels * hw_size;
   const int64_t out_batch_stride = channels * patches_per_image;
 
   constexpr int64_t TILE_H = 16;
   constexpr int64_t TILE_W = 16;
+  constexpr int64_t CHANNEL_UNROLL = 8;
 
-  auto process_tile = [=](int64_t b, int64_t h_start, int64_t w_start) {
-    const int64_t h_end = std::min(h_start + TILE_H, output_h);
-    const int64_t w_end = std::min(w_start + TILE_W, output_w);
+  auto process_tile = [=](const int8_t* batch_input, int8_t* batch_output,
+                          int64_t h_start, int64_t h_end,
+                          int64_t w_start, int64_t w_end) {
+    for (int64_t c = 0; c < channels; c += CHANNEL_UNROLL) {
+      const int64_t c_end = std::min(c + CHANNEL_UNROLL, channels);
+      const int actual_unroll = c_end - c;
 
-    const int8_t* batch_input = input + b * batch_stride;
-    int8_t* batch_output = output + b * out_batch_stride;
-
-    constexpr int64_t channel_unroll = 8;
-
-    for (int64_t c = 0; c + channel_unroll <= channels; c += channel_unroll) {
-      const int8_t* channel_inputs[channel_unroll];
-      for (int i = 0; i < channel_unroll; ++i) {
+      const int8_t* channel_inputs[CHANNEL_UNROLL];
+      for (int i = 0; i < actual_unroll; ++i) {
         channel_inputs[i] = batch_input + (c + i) * hw_size;
       }
 
       for (int64_t h = h_start; h < h_end; ++h) {
-        const int64_t h_offset = h * width;
+        const int64_t input_h = h * stride;
+        const int64_t h_offset = input_h * width;
 
         for (int64_t w = w_start; w < w_end; ++w) {
+          const int64_t input_w = w * stride;
+          const int64_t input_offset = h_offset + input_w;
           const int64_t patch = h * output_w + w;
           const int64_t out_offset = patch * channels + c;
-          const int64_t input_offset = h_offset + w;
 
-          uint64_t packed = 0;
-          packed |= static_cast<uint64_t>(channel_inputs[0][input_offset]) << 0;
-          packed |= static_cast<uint64_t>(channel_inputs[1][input_offset]) << 8;
-          packed |= static_cast<uint64_t>(channel_inputs[2][input_offset]) << 16;
-          packed |= static_cast<uint64_t>(channel_inputs[3][input_offset]) << 24;
-          packed |= static_cast<uint64_t>(channel_inputs[4][input_offset]) << 32;
-          packed |= static_cast<uint64_t>(channel_inputs[5][input_offset]) << 40;
-          packed |= static_cast<uint64_t>(channel_inputs[6][input_offset]) << 48;
-          packed |= static_cast<uint64_t>(channel_inputs[7][input_offset]) << 56;
-
-          std::memcpy(batch_output + out_offset, &packed, sizeof(packed));
-        }
-      }
-    }
-
-    for (int64_t c = channels - (channels % channel_unroll); c < channels; ++c) {
-      const int8_t* channel_input = batch_input + c * hw_size;
-
-      for (int64_t h = h_start; h < h_end; ++h) {
-        const int64_t h_offset = h * width;
-
-        for (int64_t w = w_start; w < w_end; ++w) {
-          const int64_t patch = h * output_w + w;
-          const int64_t out_offset = patch * channels + c;
-          const int64_t input_offset = h_offset + w;
-
-          batch_output[out_offset] = channel_input[input_offset];
+          if (actual_unroll == CHANNEL_UNROLL) {
+            uint64_t packed = 0;
+            for (int i = 0; i < CHANNEL_UNROLL; ++i) {
+              packed |= static_cast<uint64_t>(channel_inputs[i][input_offset]) << (i * 8);
+            }
+            std::memcpy(batch_output + out_offset, &packed, sizeof(packed));
+          } else {
+            for (int i = 0; i < actual_unroll; ++i) {
+              batch_output[out_offset + i] = channel_inputs[i][input_offset];
+            }
+          }
         }
       }
     }
   };
 
-  if (tp != nullptr) {
-    const int64_t num_h_tiles = (output_h + TILE_H - 1) / TILE_H;
-    const int64_t num_w_tiles = (output_w + TILE_W - 1) / TILE_W;
-    const int64_t total_tiles = batch_size * num_h_tiles * num_w_tiles;
+  auto process_batch = [=](int64_t b) {
+    const int8_t* batch_input = input + b * batch_stride;
+    int8_t* batch_output = output + b * out_batch_stride;
+
+    for (int64_t h_start = 0; h_start < output_h; h_start += TILE_H) {
+      const int64_t h_end = std::min(h_start + TILE_H, output_h);
+      for (int64_t w_start = 0; w_start < output_w; w_start += TILE_W) {
+        const int64_t w_end = std::min(w_start + TILE_W, output_w);
+        process_tile(batch_input, batch_output, h_start, h_end, w_start, w_end);
+      }
+    }
+  };
+
+  if (tp != nullptr && batch_size > 4) {
+    auto spatial_process = [&](int64_t work_id) {
+      const int64_t b = work_id / output_h;
+      const int64_t h = work_id % output_h;
+      if (b >= batch_size) return;
+
+      const int8_t* batch_input = input + b * batch_stride;
+      int8_t* batch_output = output + b * out_batch_stride;
+
+      const int64_t h_start = h;
+      const int64_t h_end = h + 1;
+      process_tile(batch_input, batch_output, h_start, h_end, 0, output_w);
+    };
 
     onnxruntime::concurrency::ThreadPool::TrySimpleParallelFor(
-        tp, total_tiles, [=](int64_t work_index) {
-          const int64_t b = work_index / (num_h_tiles * num_w_tiles);
-          const int64_t tile_h = (work_index / num_w_tiles) % num_h_tiles;
-          const int64_t tile_w = work_index % num_w_tiles;
-
-          const int64_t h_start = tile_h * TILE_H;
-          const int64_t w_start = tile_w * TILE_W;
-
-          process_tile(b, h_start, w_start);
-        });
+        tp, batch_size * output_h, spatial_process);
   } else {
     for (int64_t b = 0; b < batch_size; ++b) {
-      for (int64_t h = 0; h < output_h; h += TILE_H) {
-        for (int64_t w = 0; w < output_w; w += TILE_W) {
-          process_tile(b, h, w);
-        }
-      }
+      process_batch(b);
     }
   }
 }
@@ -261,7 +256,7 @@ void im2row_3x3_stride1(
   constexpr int64_t patch_size = 9;
   constexpr int64_t TILE_H = 16;
   constexpr int64_t TILE_W = 16;
-  constexpr int64_t channel_unroll = 4;
+  constexpr int64_t channel_unroll = 8;
 
   auto process_tile = [=](int64_t b, int64_t h_start, int64_t w_start) {
     const int64_t h_end = std::min(h_start + TILE_H, output_h);
@@ -630,9 +625,9 @@ void im2row(
   auto im2row_start = std::chrono::high_resolution_clock::now();
 
   if (kernel_h == 1 && kernel_w == 1) {
-    im2row_1x1_stride1(im2row_input, output,
-                       batch_size, channels, padded_height, padded_width,
-                       stride_h, tp);
+    im2row_1x1_optimized(im2row_input, output,
+                         batch_size, channels, padded_height, padded_width,
+                         stride_h, tp);
   } else if (kernel_h == 3 && kernel_w == 3) {
     im2row_3x3_dispatch(im2row_input, output,
                         batch_size, channels, padded_height, padded_width,

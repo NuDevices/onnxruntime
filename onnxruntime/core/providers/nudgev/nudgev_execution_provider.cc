@@ -261,7 +261,6 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
 
     params.N = effective_batch_size * params.output_height * params.output_width;
     params.K = input_channels * KH * KW;
-    const size_t buffer_size = params.N * params.K;
     const size_t temp_buffer_size = params.N * OC;
     const size_t input_size = effective_batch_size * input_channels * input_height * input_width;
     const size_t padded_input = effective_batch_size * input_channels * max_padded_height * max_padded_width;
