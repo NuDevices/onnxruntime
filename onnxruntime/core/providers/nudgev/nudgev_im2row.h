@@ -449,6 +449,179 @@ void im2row_3x3_unrolled(
   }
 }
 
+void im2row_3x3_stride1_optimized(
+    const int8_t* __restrict input,
+    int8_t* __restrict output,
+    int64_t batch_size,
+    int64_t channels,
+    int64_t height,
+    int64_t width,
+    onnxruntime::concurrency::ThreadPool* tp) {
+  const int64_t output_h = height - 2;
+  const int64_t output_w = width - 2;
+  const int64_t patches_per_image = output_h * output_w;
+  constexpr int64_t patch_size = 9;
+  constexpr int64_t TILE_H = 32;
+  constexpr int64_t TILE_W = 32;
+  constexpr int64_t channel_unroll = 8;
+  constexpr int64_t w_unroll = 4;
+
+  auto process_tile = [=](int64_t b, int64_t h_start, int64_t w_start) {
+    const int64_t h_end = std::min(h_start + TILE_H, output_h);
+    const int64_t w_end = std::min(w_start + TILE_W, output_w);
+
+    const int8_t* batch_input = input + b * channels * height * width;
+    int8_t* batch_output = output + b * patches_per_image * channels * patch_size;
+
+    for (int64_t h = h_start; h < h_end; ++h) {
+      const int64_t row0 = h * width;
+      const int64_t row1 = (h + 1) * width;
+      const int64_t row2 = (h + 2) * width;
+      int64_t w = w_start;
+      for (; w + w_unroll <= w_end; w += w_unroll) {
+        int8_t* output_ptr0 = batch_output + (h * output_w + w) * channels * patch_size;
+        int8_t* output_ptr1 = output_ptr0 + channels * patch_size;
+        int8_t* output_ptr2 = output_ptr1 + channels * patch_size;
+        int8_t* output_ptr3 = output_ptr2 + channels * patch_size;
+        int64_t c = 0;
+        for (; c <= channels - channel_unroll; c += channel_unroll) {
+          for (int i = 0; i < channel_unroll; ++i) {
+            const int8_t* channel_input = batch_input + (c + i) * height * width;
+            {
+              int8_t* patch_output = output_ptr0 + (c + i) * patch_size;
+              const int8_t* src0 = channel_input + row0 + w;
+              const int8_t* src1 = channel_input + row1 + w;
+              const int8_t* src2 = channel_input + row2 + w;
+
+              patch_output[0] = src0[0];
+              patch_output[1] = src0[1];
+              patch_output[2] = src0[2];
+              patch_output[3] = src1[0];
+              patch_output[4] = src1[1];
+              patch_output[5] = src1[2];
+              patch_output[6] = src2[0];
+              patch_output[7] = src2[1];
+              patch_output[8] = src2[2];
+            }
+            {
+              int8_t* patch_output = output_ptr1 + (c + i) * patch_size;
+              const int8_t* src0 = channel_input + row0 + w + 1;
+              const int8_t* src1 = channel_input + row1 + w + 1;
+              const int8_t* src2 = channel_input + row2 + w + 1;
+
+              patch_output[0] = src0[0];
+              patch_output[1] = src0[1];
+              patch_output[2] = src0[2];
+              patch_output[3] = src1[0];
+              patch_output[4] = src1[1];
+              patch_output[5] = src1[2];
+              patch_output[6] = src2[0];
+              patch_output[7] = src2[1];
+              patch_output[8] = src2[2];
+            }
+            {
+              int8_t* patch_output = output_ptr2 + (c + i) * patch_size;
+              const int8_t* src0 = channel_input + row0 + w + 2;
+              const int8_t* src1 = channel_input + row1 + w + 2;
+              const int8_t* src2 = channel_input + row2 + w + 2;
+
+              patch_output[0] = src0[0];
+              patch_output[1] = src0[1];
+              patch_output[2] = src0[2];
+              patch_output[3] = src1[0];
+              patch_output[4] = src1[1];
+              patch_output[5] = src1[2];
+              patch_output[6] = src2[0];
+              patch_output[7] = src2[1];
+              patch_output[8] = src2[2];
+            }
+            {
+              int8_t* patch_output = output_ptr3 + (c + i) * patch_size;
+              const int8_t* src0 = channel_input + row0 + w + 3;
+              const int8_t* src1 = channel_input + row1 + w + 3;
+              const int8_t* src2 = channel_input + row2 + w + 3;
+
+              patch_output[0] = src0[0];
+              patch_output[1] = src0[1];
+              patch_output[2] = src0[2];
+              patch_output[3] = src1[0];
+              patch_output[4] = src1[1];
+              patch_output[5] = src1[2];
+              patch_output[6] = src2[0];
+              patch_output[7] = src2[1];
+              patch_output[8] = src2[2];
+            }
+          }
+        }
+        for (; c < channels; ++c) {
+          const int8_t* channel_input = batch_input + c * height * width;
+          for (int64_t wi = 0; wi < w_unroll; ++wi) {
+            int8_t* patch_output = batch_output + (h * output_w + w + wi) * channels * patch_size + c * patch_size;
+            const int8_t* src0 = channel_input + row0 + w + wi;
+            const int8_t* src1 = channel_input + row1 + w + wi;
+            const int8_t* src2 = channel_input + row2 + w + wi;
+
+            patch_output[0] = src0[0];
+            patch_output[1] = src0[1];
+            patch_output[2] = src0[2];
+            patch_output[3] = src1[0];
+            patch_output[4] = src1[1];
+            patch_output[5] = src1[2];
+            patch_output[6] = src2[0];
+            patch_output[7] = src2[1];
+            patch_output[8] = src2[2];
+          }
+        }
+      }
+      for (; w < w_end; ++w) {
+        int8_t* output_ptr = batch_output + (h * output_w + w) * channels * patch_size;
+
+        for (int64_t c = 0; c < channels; ++c) {
+          const int8_t* channel_input = batch_input + c * height * width;
+          int8_t* patch_output = output_ptr + c * patch_size;
+
+          const int8_t* src0 = channel_input + row0 + w;
+          const int8_t* src1 = channel_input + row1 + w;
+          const int8_t* src2 = channel_input + row2 + w;
+
+          patch_output[0] = src0[0];
+          patch_output[1] = src0[1];
+          patch_output[2] = src0[2];
+          patch_output[3] = src1[0];
+          patch_output[4] = src1[1];
+          patch_output[5] = src1[2];
+          patch_output[6] = src2[0];
+          patch_output[7] = src2[1];
+          patch_output[8] = src2[2];
+        }
+      }
+    }
+  };
+
+  if (tp != nullptr) {
+    const int64_t num_h_tiles = (output_h + TILE_H - 1) / TILE_H;
+    const int64_t num_w_tiles = (output_w + TILE_W - 1) / TILE_W;
+    const int64_t total_tiles = batch_size * num_h_tiles * num_w_tiles;
+
+    onnxruntime::concurrency::ThreadPool::TrySimpleParallelFor(
+        tp, total_tiles, [=](int64_t work_index) {
+          const int64_t b = work_index / (num_h_tiles * num_w_tiles);
+          const int64_t tile_h = (work_index / num_w_tiles) % num_h_tiles;
+          const int64_t tile_w = work_index % num_w_tiles;
+
+          process_tile(b, tile_h * TILE_H, tile_w * TILE_W);
+        });
+  } else {
+    for (int64_t b = 0; b < batch_size; ++b) {
+      for (int64_t h = 0; h < output_h; h += TILE_H) {
+        for (int64_t w = 0; w < output_w; w += TILE_W) {
+          process_tile(b, h, w);
+        }
+      }
+    }
+  }
+}
+
 void im2row_3x3_stride1(
     const int8_t* input,
     int8_t* output,
@@ -612,7 +785,7 @@ void im2row_3x3_dispatch(
     int64_t stride,
     onnxruntime::concurrency::ThreadPool* tp) {
   if (stride == 1) {
-    im2row_3x3_stride1(input, output, batch_size, channels, height, width, tp);
+    im2row_3x3_stride1_optimized(input, output, batch_size, channels, height, width, tp);
   } else if (stride == 2) {
     im2row_3x3_stride2(input, output, batch_size, channels, height, width, tp);
   } else {
@@ -794,6 +967,8 @@ void im2row(
   int64_t padded_width = width + pads[1] + pads[3];
   const int8_t* im2row_input = nullptr;
 
+  auto start_padding = std::chrono::high_resolution_clock::now();
+
   if (pads[0] != 0 || pads[1] != 0 || pads[2] != 0 || pads[3] != 0) {
     auto pad_func = [=](int64_t n) {
       for (int64_t c = 0; c < channels; ++c) {
@@ -826,7 +1001,7 @@ void im2row(
   }
 
   auto end_padding = std::chrono::high_resolution_clock::now();
-  auto duration_padding = std::chrono::duration_cast<std::chrono::microseconds>(end_padding - start);
+  auto duration_padding = std::chrono::duration_cast<std::chrono::microseconds>(end_padding - start_padding);
   std::cout << "padding time: " << duration_padding.count() << " microseconds" << std::endl;
 
   auto im2row_start = std::chrono::high_resolution_clock::now();
