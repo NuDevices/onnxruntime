@@ -6,6 +6,7 @@
 #include <immintrin.h>
 #include <iostream>
 #include "core/platform/threadpool.h"
+#include "Eigen/Core"
 #include <algorithm>
 
 void convert_and_center_saturated(
@@ -351,6 +352,47 @@ void im2row_1x1_stride2(
   }
 }
 
+void im2row_1x1_transpose(
+    const int8_t* input,
+    int8_t* output,
+    int64_t batch_size,
+    int64_t channels,
+    int64_t height,
+    int64_t width,
+    onnxruntime::concurrency::ThreadPool* tp) {
+  const int64_t hw_size = height * width;
+  const int64_t batch_stride = channels * hw_size;
+  const int64_t total_pixels = batch_size * hw_size;
+  constexpr int64_t CHANNEL_UNROLL = 8;
+
+  auto process_pixel = [&](int64_t pixel_idx) {
+    const int64_t n = pixel_idx / hw_size;
+    const int64_t hw_offset = pixel_idx % hw_size;
+    const int64_t h = hw_offset / width;
+    const int64_t w = hw_offset % width;
+    int8_t* out_row = output + pixel_idx * channels;
+    const int8_t* batch_input = input + n * batch_stride;
+    for (int64_t c = 0; c < channels; c += CHANNEL_UNROLL) {
+      const int64_t c_end = std::min(c + CHANNEL_UNROLL, channels);
+      const int64_t actual_unroll = c_end - c;
+      if (actual_unroll == CHANNEL_UNROLL) {
+        uint64_t packed = 0;
+        for (int i = 0; i < CHANNEL_UNROLL; i++) {
+          const int8_t val = batch_input[(c + i) * hw_size + h * width + w];
+          packed |= static_cast<uint64_t>(val) << (i * 8);
+        }
+        std::memcpy(out_row + c, &packed, sizeof(packed));
+      } else {
+        for (int i = 0; i < actual_unroll; i++) {
+          out_row[c + i] = batch_input[(c + i) * hw_size + h * width + w];
+        }
+      }
+    }
+  };
+
+  onnxruntime::concurrency::ThreadPool::TrySimpleParallelFor(tp, total_pixels, process_pixel);
+}
+
 void im2row_1x1_dispatch(
     const int8_t* input,
     int8_t* output,
@@ -361,7 +403,7 @@ void im2row_1x1_dispatch(
     int64_t stride,
     onnxruntime::concurrency::ThreadPool* tp) {
   if (stride == 1) {
-    im2row_1x1_stride1(input, output, batch_size, channels, height, width, tp);
+    im2row_1x1_transpose(input, output, batch_size, channels, height, width, tp);
   } else if (stride == 2) {
     im2row_1x1_stride2(input, output, batch_size, channels, height, width, tp);
   } else {
@@ -1029,4 +1071,172 @@ void im2row(
   auto im2row_end = std::chrono::high_resolution_clock::now();
   auto im2row_duration = std::chrono::duration_cast<std::chrono::microseconds>(im2row_end - im2row_start);
   std::cout << "Im2row time: " << im2row_duration.count() << " microseconds" << std::endl;
+}
+
+static inline void transpose_8x8_int8_sse(const int8_t* src, int8_t* dst,
+                                          int64_t src_stride, int64_t dst_stride) {
+  __m128i row0 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(src + 0 * src_stride));
+  __m128i row1 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(src + 1 * src_stride));
+  __m128i row2 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(src + 2 * src_stride));
+  __m128i row3 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(src + 3 * src_stride));
+  __m128i row4 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(src + 4 * src_stride));
+  __m128i row5 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(src + 5 * src_stride));
+  __m128i row6 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(src + 6 * src_stride));
+  __m128i row7 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(src + 7 * src_stride));
+
+  __m128i int01 = _mm_unpacklo_epi8(row0, row1);
+  __m128i int23 = _mm_unpacklo_epi8(row2, row3);
+  __m128i int45 = _mm_unpacklo_epi8(row4, row5);
+  __m128i int67 = _mm_unpacklo_epi8(row6, row7);
+
+  __m128i int0123_lo = _mm_unpacklo_epi16(int01, int23);
+  __m128i int0123_hi = _mm_unpackhi_epi16(int01, int23);
+  __m128i int4567_lo = _mm_unpacklo_epi16(int45, int67);
+  __m128i int4567_hi = _mm_unpackhi_epi16(int45, int67);
+
+  __m128i int01234567_0 = _mm_unpacklo_epi32(int0123_lo, int4567_lo);
+  __m128i int01234567_1 = _mm_unpackhi_epi32(int0123_lo, int4567_lo);
+  __m128i int01234567_2 = _mm_unpacklo_epi32(int0123_hi, int4567_hi);
+  __m128i int01234567_3 = _mm_unpackhi_epi32(int0123_hi, int4567_hi);
+  _mm_storel_epi64(reinterpret_cast<__m128i*>(dst + 0 * dst_stride),
+                   _mm_unpacklo_epi64(int01234567_0, int01234567_0));
+  _mm_storel_epi64(reinterpret_cast<__m128i*>(dst + 1 * dst_stride),
+                   _mm_unpackhi_epi64(int01234567_0, int01234567_0));
+  _mm_storel_epi64(reinterpret_cast<__m128i*>(dst + 2 * dst_stride),
+                   _mm_unpacklo_epi64(int01234567_1, int01234567_1));
+  _mm_storel_epi64(reinterpret_cast<__m128i*>(dst + 3 * dst_stride),
+                   _mm_unpackhi_epi64(int01234567_1, int01234567_1));
+  _mm_storel_epi64(reinterpret_cast<__m128i*>(dst + 4 * dst_stride),
+                   _mm_unpacklo_epi64(int01234567_2, int01234567_2));
+  _mm_storel_epi64(reinterpret_cast<__m128i*>(dst + 5 * dst_stride),
+                   _mm_unpackhi_epi64(int01234567_2, int01234567_2));
+  _mm_storel_epi64(reinterpret_cast<__m128i*>(dst + 6 * dst_stride),
+                   _mm_unpacklo_epi64(int01234567_3, int01234567_3));
+  _mm_storel_epi64(reinterpret_cast<__m128i*>(dst + 7 * dst_stride),
+                   _mm_unpackhi_epi64(int01234567_3, int01234567_3));
+}
+
+static inline void transpose_8x8_int8_avx512(
+    const int8_t* src, int8_t* dst,
+    int64_t src_stride, int64_t dst_stride) {
+  __m512i row0 = _mm512_zextsi128_si512(
+      _mm_loadl_epi64(reinterpret_cast<const __m128i*>(src + 0 * src_stride)));
+  __m512i row1 = _mm512_zextsi128_si512(
+      _mm_loadl_epi64(reinterpret_cast<const __m128i*>(src + 1 * src_stride)));
+  __m512i row2 = _mm512_zextsi128_si512(
+      _mm_loadl_epi64(reinterpret_cast<const __m128i*>(src + 2 * src_stride)));
+  __m512i row3 = _mm512_zextsi128_si512(
+      _mm_loadl_epi64(reinterpret_cast<const __m128i*>(src + 3 * src_stride)));
+  __m512i row4 = _mm512_zextsi128_si512(
+      _mm_loadl_epi64(reinterpret_cast<const __m128i*>(src + 4 * src_stride)));
+  __m512i row5 = _mm512_zextsi128_si512(
+      _mm_loadl_epi64(reinterpret_cast<const __m128i*>(src + 5 * src_stride)));
+  __m512i row6 = _mm512_zextsi128_si512(
+      _mm_loadl_epi64(reinterpret_cast<const __m128i*>(src + 6 * src_stride)));
+  __m512i row7 = _mm512_zextsi128_si512(
+      _mm_loadl_epi64(reinterpret_cast<const __m128i*>(src + 7 * src_stride)));
+
+  __m512i int01 = _mm512_unpacklo_epi8(row0, row1);
+  __m512i int23 = _mm512_unpacklo_epi8(row2, row3);
+  __m512i int45 = _mm512_unpacklo_epi8(row4, row5);
+  __m512i int67 = _mm512_unpacklo_epi8(row6, row7);
+
+  __m512i int0123_lo = _mm512_unpacklo_epi16(int01, int23);
+  __m512i int0123_hi = _mm512_unpackhi_epi16(int01, int23);
+  __m512i int4567_lo = _mm512_unpacklo_epi16(int45, int67);
+  __m512i int4567_hi = _mm512_unpackhi_epi16(int45, int67);
+
+  __m512i int01234567_0 = _mm512_unpacklo_epi32(int0123_lo, int4567_lo);
+  __m512i int01234567_1 = _mm512_unpackhi_epi32(int0123_lo, int4567_lo);
+  __m512i int01234567_2 = _mm512_unpacklo_epi32(int0123_hi, int4567_hi);
+  __m512i int01234567_3 = _mm512_unpackhi_epi32(int0123_hi, int4567_hi);
+  _mm_storel_epi64(reinterpret_cast<__m128i*>(dst + 0 * dst_stride),
+                   _mm512_castsi512_si128(int01234567_0));
+  _mm_storel_epi64(reinterpret_cast<__m128i*>(dst + 1 * dst_stride),
+                   _mm512_extracti32x4_epi32(int01234567_0, 1));
+  _mm_storel_epi64(reinterpret_cast<__m128i*>(dst + 2 * dst_stride),
+                   _mm512_castsi512_si128(int01234567_1));
+  _mm_storel_epi64(reinterpret_cast<__m128i*>(dst + 3 * dst_stride),
+                   _mm512_extracti32x4_epi32(int01234567_1, 1));
+  _mm_storel_epi64(reinterpret_cast<__m128i*>(dst + 4 * dst_stride),
+                   _mm512_castsi512_si128(int01234567_2));
+  _mm_storel_epi64(reinterpret_cast<__m128i*>(dst + 5 * dst_stride),
+                   _mm512_extracti32x4_epi32(int01234567_2, 1));
+  _mm_storel_epi64(reinterpret_cast<__m128i*>(dst + 6 * dst_stride),
+                   _mm512_castsi512_si128(int01234567_3));
+  _mm_storel_epi64(reinterpret_cast<__m128i*>(dst + 7 * dst_stride),
+                   _mm512_extracti32x4_epi32(int01234567_3, 1));
+}
+
+static inline void transpose_8x8_int8_fallback(const int8_t* src, int8_t* dst,
+                                               int64_t src_stride, int64_t dst_stride) {
+  for (int i = 0; i < 8; ++i) {
+    for (int j = 0; j < 8; ++j) {
+      dst[j * dst_stride + i] = src[i * src_stride + j];
+    }
+  }
+}
+
+void transpose_output_matrix(const int8_t* input,
+                             int8_t* output,
+                             int64_t batch_size,
+                             int64_t hw,
+                             int64_t channels,
+                             onnxruntime::concurrency::ThreadPool* tp) {
+  auto process_batch = [&](int64_t b) {
+    const int8_t* batch_input = input + b * hw * channels;
+    int8_t* batch_output = output + b * hw * channels;
+
+    for (int64_t i = 0; i < hw; i += 8) {
+      for (int64_t j = 0; j < channels; j += 8) {
+        if (i + 8 <= hw && j + 8 <= channels) {
+#ifdef __AVX512F__
+          if (__builtin_cpu_supports("avx512f")) {
+            transpose_8x8_int8_avx512(
+                &batch_input[i * channels + j],
+                &batch_output[j * hw + i],
+                channels,
+                hw);
+            continue;
+          }
+#endif
+
+#ifdef __SSE2__
+          if (__builtin_cpu_supports("sse2")) {
+            transpose_8x8_int8_sse(
+                &batch_input[i * channels + j],
+                &batch_output[j * hw + i],
+                channels,
+                hw);
+            continue;
+          }
+#endif
+          for (int64_t ii = i; ii < i + 8; ++ii) {
+            for (int64_t jj = j; jj < j + 8; ++jj) {
+              batch_output[jj * hw + ii] = batch_input[ii * channels + jj];
+            }
+          }
+        } else {
+          const int64_t i_end = std::min(i + 8, hw);
+          const int64_t j_end = std::min(j + 8, channels);
+          for (int64_t ii = i; ii < i_end; ++ii) {
+            for (int64_t jj = j; jj < j_end; ++jj) {
+              batch_output[jj * hw + ii] = batch_input[ii * channels + jj];
+            }
+          }
+        }
+      }
+    }
+  };
+
+  if (tp != nullptr && batch_size > 1) {
+    onnxruntime::concurrency::ThreadPool::TrySimpleParallelFor(
+        tp,
+        batch_size,
+        process_batch);
+  } else {
+    for (int64_t b = 0; b < batch_size; ++b) {
+      process_batch(b);
+    }
+  }
 }

@@ -15,8 +15,9 @@
 #include <chrono>
 #include <iostream>
 #include <immintrin.h>
-
+#include "Eigen/Core"
 #include "core/platform/threadpool.h"
+#include "core/providers/cpu/tensor/transpose.h"
 #include "core/platform/ort_mutex.h"
 
 namespace onnxruntime {
@@ -548,6 +549,7 @@ Status NudgevExecutionProvider::Compile(
       int8_t* im2row_data = params->im2row_buffer.data();
 
       auto start = std::chrono::high_resolution_clock::now();
+
       im2row(input_data,
              params->im2row_buffer.data(),
              actual_batch_size,
@@ -603,20 +605,14 @@ Status NudgevExecutionProvider::Compile(
           params->temp_buffer[n * output_channels + m] = static_cast<int8_t>(sum);
         }
       }
-
-      for (int64_t b = 0; b < actual_batch_size; ++b) {
-        for (int64_t oc = 0; oc < output_channels; ++oc) {
-          for (int64_t oh = 0; oh < params->output_height; ++oh) {
-            for (int64_t ow = 0; ow < params->output_width; ++ow) {
-              const int64_t output_idx = ((b * output_channels + oc) * params->output_height + oh) * params->output_width + ow;
-              const int64_t buffer_idx = ((b * params->output_height + oh) * params->output_width + ow) * output_channels + oc;
-              output_data[output_idx] = params->temp_buffer[buffer_idx];
-            }
-          }
-        }
-      }
+      auto start_transpose = std::chrono::high_resolution_clock::now();
+      const int64_t HW = params->output_height * params->output_width;
+      transpose_output_matrix(params->temp_buffer.data(), output_data,
+                              actual_batch_size, HW, output_channels, tp);
       auto total_end = std::chrono::high_resolution_clock::now();
       auto total_duration = std::chrono::duration_cast<std::chrono::microseconds>(total_end - start);
+      auto total_transpose = std::chrono::duration_cast<std::chrono::microseconds>(total_end - start_transpose);
+      std::cout << "Conv Op - Total transpose time: " << total_transpose.count() << " microseconds" << std::endl;
       std::cout << "Conv Op - Total execution time: " << total_duration.count() << " microseconds" << std::endl;
       return Status::OK();
     };
