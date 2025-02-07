@@ -6,7 +6,6 @@
 #include <immintrin.h>
 #include <iostream>
 #include "core/platform/threadpool.h"
-#include "Eigen/Core"
 #include <algorithm>
 
 void convert_and_center_saturated(
@@ -1167,7 +1166,6 @@ static inline void transpose_8x8_int8_avx512(
   _mm_storel_epi64(reinterpret_cast<__m128i*>(dst + 7 * dst_stride),
                    _mm512_extracti32x4_epi32(int01234567_3, 1));
 }
-
 static inline void transpose_8x8_int8_fallback(const int8_t* src, int8_t* dst,
                                                int64_t src_stride, int64_t dst_stride) {
   for (int i = 0; i < 8; ++i) {
@@ -1176,7 +1174,6 @@ static inline void transpose_8x8_int8_fallback(const int8_t* src, int8_t* dst,
     }
   }
 }
-
 void transpose_output_matrix(const int8_t* input,
                              int8_t* output,
                              int64_t batch_size,

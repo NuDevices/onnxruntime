@@ -1,5 +1,6 @@
 #include "core/providers/nudgev/nudgev_execution_provider.h"
 #include "core/providers/nudgev/nudgev_im2row.h"
+#include "core/providers/nudgev/nudgev_im2col.h"
 #include "core/framework/compute_capability.h"
 #include "core/framework/kernel_registry.h"
 #include "core/framework/op_kernel.h"
@@ -15,9 +16,7 @@
 #include <chrono>
 #include <iostream>
 #include <immintrin.h>
-#include "Eigen/Core"
 #include "core/platform/threadpool.h"
-#include "core/providers/cpu/tensor/transpose.h"
 #include "core/platform/ort_mutex.h"
 
 namespace onnxruntime {
@@ -333,18 +332,8 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
     }
 
     params.weights.resize(OC * IC * KH * KW);
-
-    for (int64_t oc = 0; oc < OC; ++oc) {
-      for (int64_t ic = 0; ic < IC; ++ic) {
-        for (int64_t kh = 0; kh < KH; ++kh) {
-          for (int64_t kw = 0; kw < KW; ++kw) {
-            const int64_t k = ic * (KH * KW) + kh * KW + kw;
-            const int64_t dst_idx = k * OC + oc;
-            const int64_t src_idx = (((oc * IC) + ic) * KH + kh) * KW + kw;
-            params.weights[dst_idx] = static_cast<int8_t>(original_weights[src_idx] - params.weight_zp);
-          }
-        }
-      }
+    for (int64_t i = 0; i < OC * IC * KH * KW; ++i) {
+      params.weights[i] = static_cast<int8_t>(original_weights[i] - params.weight_zp);
     }
 
     // Bias parameters (optional DequantizeLinear)
@@ -546,11 +535,10 @@ Status NudgevExecutionProvider::Compile(
       // Get data pointers
       const auto* input_data = input->Data<int8_t>();
       auto* output_data = Y->MutableData<int8_t>();
-      int8_t* im2row_data = params->im2row_buffer.data();
 
       auto start = std::chrono::high_resolution_clock::now();
 
-      im2row(input_data,
+      im2col(input_data,
              params->im2row_buffer.data(),
              actual_batch_size,
              input_channels,
@@ -569,6 +557,7 @@ Status NudgevExecutionProvider::Compile(
       auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
 
       std::cout << "=== Conv Op - Im2Row Debug Info ===\n";
+
       std::cout << "Input Shape: (" << actual_batch_size << ", " << input_channels << ", "
                 << input_height << ", " << input_width << ")\n";
       std::cout << "Im2Row Output Shape: [" << params->N << " x " << params->K << "]" << std::endl;
@@ -578,41 +567,30 @@ Status NudgevExecutionProvider::Compile(
       std::cout << "Padding: (" << params->pads[0] << ", " << params->pads[1] << ")\n";
       std::cout << "Output Shape: (" << actual_batch_size << ", " << output_channels << ", "
                 << params->output_height << ", " << params->output_width << ")\n";
-      std::cout << "Conv Op - Im2row execution time: " << duration.count() << " microseconds" << std::endl;
+
+      std::cout << "Conv Op - Im2col execution time: " << duration.count() << " microseconds" << std::endl;
       std::cout << "====================================\n";
 
       // GEMM computation phase
-      for (int32_t n = 0; n < params->N; ++n) {
-        for (int32_t m = 0; m < output_channels; ++m) {
-          int64_t acc = 0;
-          for (int32_t k = 0; k < params->K; ++k) {
-            acc += static_cast<int32_t>(params->weights[k * output_channels + m]) * im2row_data[n * params->K + k];
-          }
+      const int64_t patches_per_image = params->output_height * params->output_width;
 
-          if (params->has_bias) {
-            acc += params->bias[m];
-          }
-          int64_t scaled_acc = static_cast<int64_t>(acc) * params->M_fixed;
-          int32_t sum = static_cast<int32_t>((scaled_acc + 0x4000) >> 15);
+      gemm_i8_after_im2col(
+          params->weights.data(),                            // weights [OC, K]
+          params->im2row_buffer.data(),                      // im2col_output [B, K, patches_per_image]
+          output_data,                                       // output [B, OC, patches_per_image]
+          output_channels,                                   // OC
+          params->K,                                         // K (IC*KH*KW)
+          patches_per_image,                                 // patches per single batch
+          actual_batch_size,                                 // batch_size (nuovo parametro)
+          params->has_bias ? params->bias.data() : nullptr,  // bias
+          params->has_bias,                                  // has_bias
+          params->M_fixed,                                   // M_fixed
+          params->output_zp,                                 // output_zero_point
+          params->fused_relu                                 // fused_relu
+      );
 
-          if (params->fused_relu) {
-            sum = std::max<int32_t>(0, sum);
-          }
-
-          sum += static_cast<int32_t>(params->output_zp);
-          sum = std::min<int32_t>(127, std::max<int32_t>(-128, sum));
-
-          params->temp_buffer[n * output_channels + m] = static_cast<int8_t>(sum);
-        }
-      }
-      auto start_transpose = std::chrono::high_resolution_clock::now();
-      const int64_t HW = params->output_height * params->output_width;
-      transpose_output_matrix(params->temp_buffer.data(), output_data,
-                              actual_batch_size, HW, output_channels, tp);
       auto total_end = std::chrono::high_resolution_clock::now();
       auto total_duration = std::chrono::duration_cast<std::chrono::microseconds>(total_end - start);
-      auto total_transpose = std::chrono::duration_cast<std::chrono::microseconds>(total_end - start_transpose);
-      std::cout << "Conv Op - Total transpose time: " << total_transpose.count() << " microseconds" << std::endl;
       std::cout << "Conv Op - Total execution time: " << total_duration.count() << " microseconds" << std::endl;
       return Status::OK();
     };
