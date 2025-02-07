@@ -382,7 +382,7 @@ void im2col_generic(
 
 void im2col(
     const int8_t* input,
-    int8_t* output,
+    int8_t** output,
     int64_t batch_size,
     int64_t channels,
     int64_t height,
@@ -447,19 +447,22 @@ void im2col(
   auto im2col_start = std::chrono::high_resolution_clock::now();
 
   if (kernel_h == 7 && kernel_w == 7) {
-    im2col_7x7(im2col_input, output, batch_size, channels,
+    im2col_7x7(im2col_input, *output, batch_size, channels,
                padded_height, padded_width, stride_h,
                output_h, output_w, tp);
   } else if (kernel_h == 3 && kernel_w == 3) {
-    im2col_3x3(im2col_input, output, batch_size, channels,
+    im2col_3x3(im2col_input, *output, batch_size, channels,
                padded_height, padded_width, stride_h,
                output_h, output_w, tp);
+  } else if (kernel_h == 1 && kernel_w == 1 && stride_h == 1) {
+    *output = const_cast<int8_t*>(im2col_input);  // Modifica il puntatore originale
+    return;
   } else if (kernel_h == 1 && kernel_w == 1) {
-    im2col_1x1(im2col_input, output, batch_size, channels,
+    im2col_1x1(im2col_input, *output, batch_size, channels,
                padded_height, padded_width, stride_h,
                output_h, output_w, tp);
   } else {
-    im2col_generic(im2col_input, output, batch_size, channels,
+    im2col_generic(im2col_input, *output, batch_size, channels,
                    padded_height, padded_width, kernel_h, kernel_w,
                    stride_h, output_h, output_w, tp);
   }
@@ -469,7 +472,6 @@ void im2col(
             << std::chrono::duration_cast<std::chrono::microseconds>(im2col_end - im2col_start).count()
             << " microseconds" << std::endl;
 }
-
 void gemm_i8_after_im2col(
     const int8_t* weights,
     const int8_t* im2col_output,

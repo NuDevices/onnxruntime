@@ -535,11 +535,11 @@ Status NudgevExecutionProvider::Compile(
       // Get data pointers
       const auto* input_data = input->Data<int8_t>();
       auto* output_data = Y->MutableData<int8_t>();
-
+      int8_t* im2row_ptr = params->im2row_buffer.data();
       auto start = std::chrono::high_resolution_clock::now();
 
       im2col(input_data,
-             params->im2row_buffer.data(),
+             &im2row_ptr,
              actual_batch_size,
              input_channels,
              input_height,
@@ -576,7 +576,7 @@ Status NudgevExecutionProvider::Compile(
 
       gemm_i8_after_im2col(
           params->weights.data(),                            // weights [OC, K]
-          params->im2row_buffer.data(),                      // im2col_output [B, K, patches_per_image]
+          im2row_ptr,                                        // im2col_output [B, K, patches_per_image]
           output_data,                                       // output [B, OC, patches_per_image]
           output_channels,                                   // OC
           params->K,                                         // K (IC*KH*KW)
