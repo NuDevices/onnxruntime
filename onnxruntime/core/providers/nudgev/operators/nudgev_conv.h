@@ -4,66 +4,11 @@
 #include <vector>
 #include <algorithm>
 #include "core/platform/threadpool.h"
-#include "core/optimizer/qdq_transformer/selectors_actions/shared/utils.h"
+#include "core/providers/nudgev/operators/satured_sub.h"
+#include <immintrin.h>
 
-void convert_and_center_saturated_im2col(
-    const int8_t* input,
-    int8_t* output,
-    int64_t batch_size,
-    int64_t elements_per_batch,
-    int8_t x_zero_point,
-    onnxruntime::concurrency::ThreadPool* tp) {
-  const __m256i vzp = _mm256_set1_epi8(x_zero_point);
-  constexpr int vec_size = 32;
-
-  if (tp != nullptr && batch_size > 1) {
-    onnxruntime::concurrency::ThreadPool::TrySimpleParallelFor(tp, batch_size, [=](long b) {
-      const int8_t* batch_input = input + b * elements_per_batch;
-      int8_t* batch_output = output + b * elements_per_batch;
-      ptrdiff_t i = 0;
-      for (; i < static_cast<ptrdiff_t>(elements_per_batch) && (i % vec_size != 0); ++i) {
-        __m128i v = _mm_set1_epi8(batch_input[i]);
-        __m128i z = _mm_set1_epi8(x_zero_point);
-        __m128i r = _mm_subs_epi8(v, z);
-        batch_output[i] = _mm_extract_epi8(r, 0);
-      }
-
-      for (; i + vec_size <= static_cast<ptrdiff_t>(elements_per_batch); i += vec_size) {
-        __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(batch_input + i));
-        __m256i r = _mm256_subs_epi8(v, vzp);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(batch_output + i), r);
-      }
-
-      for (; i < static_cast<ptrdiff_t>(elements_per_batch); ++i) {
-        __m128i v = _mm_set1_epi8(batch_input[i]);
-        __m128i z = _mm_set1_epi8(x_zero_point);
-        __m128i r = _mm_subs_epi8(v, z);
-        batch_output[i] = _mm_extract_epi8(r, 0);
-      }
-    });
-  } else {
-    ptrdiff_t i = 0;
-    for (; i < static_cast<ptrdiff_t>(elements_per_batch) && (i % vec_size != 0); ++i) {
-      __m128i v = _mm_set1_epi8(input[i]);
-      __m128i z = _mm_set1_epi8(x_zero_point);
-      __m128i r = _mm_subs_epi8(v, z);
-      output[i] = _mm_extract_epi8(r, 0);
-    }
-
-    for (; i + vec_size <= static_cast<ptrdiff_t>(elements_per_batch); i += vec_size) {
-      __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(input + i));
-      __m256i r = _mm256_subs_epi8(v, vzp);
-      _mm256_storeu_si256(reinterpret_cast<__m256i*>(output + i), r);
-    }
-
-    for (; i < static_cast<ptrdiff_t>(elements_per_batch); ++i) {
-      __m128i v = _mm_set1_epi8(input[i]);
-      __m128i z = _mm_set1_epi8(x_zero_point);
-      __m128i r = _mm_subs_epi8(v, z);
-      output[i] = _mm_extract_epi8(r, 0);
-    }
-  }
-}
+namespace onnxruntime {
+namespace nudgev {
 
 void im2col_1x1(
     const int8_t* im2col_input,
@@ -396,9 +341,9 @@ void im2col(
     int8_t* padded_buffer,
     onnxruntime::concurrency::ThreadPool* tp) {
   auto start = std::chrono::high_resolution_clock::now();
-  convert_and_center_saturated_im2col(input, input_centered_buffer,
-                                      batch_size, channels * height * width,
-                                      x_zero_point, tp);
+  onnxruntime::nudgev::satured_sub(input, input_centered_buffer,
+                                   batch_size, channels * height * width,
+                                   x_zero_point, tp);
   auto end_conversion = std::chrono::high_resolution_clock::now();
   std::cout << "conversion time: "
             << std::chrono::duration_cast<std::chrono::microseconds>(end_conversion - start).count()
@@ -455,7 +400,7 @@ void im2col(
                padded_height, padded_width, stride_h,
                output_h, output_w, tp);
   } else if (kernel_h == 1 && kernel_w == 1 && stride_h == 1) {
-    *output = const_cast<int8_t*>(im2col_input);  // Modifica il puntatore originale
+    *output = const_cast<int8_t*>(im2col_input);
     return;
   } else if (kernel_h == 1 && kernel_w == 1) {
     im2col_1x1(im2col_input, *output, batch_size, channels,
@@ -472,6 +417,7 @@ void im2col(
             << std::chrono::duration_cast<std::chrono::microseconds>(im2col_end - im2col_start).count()
             << " microseconds" << std::endl;
 }
+
 void gemm_i8_after_im2col(
     const int8_t* weights,
     const int8_t* im2col_output,
@@ -484,34 +430,80 @@ void gemm_i8_after_im2col(
     bool has_bias,
     int32_t M_fixed,
     int8_t output_zero_point,
-    bool fused_relu) {
-  for (int64_t b = 0; b < batch_size; ++b) {
-    const int8_t* batch_input = im2col_output + b * K * patches_per_image;
-    int8_t* batch_output = output + b * OC * patches_per_image;
-    for (int64_t oc = 0; oc < OC; ++oc) {
+    bool fused_relu,
+    onnxruntime::concurrency::ThreadPool* tp) {
+  constexpr int vector_size = 16;
+
+  auto process_chunk = [&](int64_t start_idx, int64_t end_idx) {
+    for (int64_t idx = start_idx; idx < end_idx; ++idx) {
+      int64_t b = idx / OC;
+      int64_t oc = idx % OC;
+      const int8_t* batch_input = im2col_output + b * K * patches_per_image;
+      int8_t* batch_output = output + b * OC * patches_per_image;
       const int8_t* weight_row = weights + oc * K;
-      for (int64_t n = 0; n < patches_per_image; ++n) {
+
+      int64_t n = 0;
+      for (; n <= patches_per_image - vector_size; n += vector_size) {
+        __m256i acc_lo = _mm256_setzero_si256();
+        __m256i acc_hi = _mm256_setzero_si256();
+        for (int64_t k = 0; k < K; ++k) {
+          int8_t w_val = weight_row[k];
+          __m256i w_vec = _mm256_set1_epi16(static_cast<int16_t>(w_val));
+          const int8_t* inp_ptr = batch_input + k * patches_per_image + n;
+          __m128i inp = _mm_loadu_si128(reinterpret_cast<const __m128i*>(inp_ptr));
+          __m256i inp_epi16 = _mm256_cvtepi8_epi16(inp);
+          __m256i prod = _mm256_mullo_epi16(w_vec, inp_epi16);
+          __m128i prod_lo = _mm256_castsi256_si128(prod);
+          __m128i prod_hi = _mm256_extracti128_si256(prod, 1);
+          acc_lo = _mm256_add_epi32(acc_lo, _mm256_cvtepi16_epi32(prod_lo));
+          acc_hi = _mm256_add_epi32(acc_hi, _mm256_cvtepi16_epi32(prod_hi));
+        }
+        alignas(32) int32_t acc_array[vector_size];
+        _mm256_store_si256(reinterpret_cast<__m256i*>(acc_array), acc_lo);
+        _mm256_store_si256(reinterpret_cast<__m256i*>(acc_array + 8), acc_hi);
+        for (int i = 0; i < vector_size; ++i) {
+          int32_t acc = acc_array[i];
+          if (has_bias)
+            acc += bias[oc];
+          int64_t scaled_acc = static_cast<int64_t>(acc) * M_fixed;
+          int32_t sum = static_cast<int32_t>((scaled_acc + 0x4000) >> 15);
+          if (fused_relu)
+            sum = std::max(sum, 0);
+          sum += output_zero_point;
+          sum = std::min(127, std::max(-128, sum));
+          batch_output[oc * patches_per_image + n + i] = static_cast<int8_t>(sum);
+        }
+      }
+      for (; n < patches_per_image; ++n) {
         int32_t acc = 0;
         for (int64_t k = 0; k < K; ++k) {
           acc += static_cast<int32_t>(weight_row[k]) *
                  static_cast<int32_t>(batch_input[k * patches_per_image + n]);
         }
-
-        if (has_bias) {
+        if (has_bias)
           acc += bias[oc];
-        }
-
         int64_t scaled_acc = static_cast<int64_t>(acc) * M_fixed;
         int32_t sum = static_cast<int32_t>((scaled_acc + 0x4000) >> 15);
-
-        if (fused_relu) {
+        if (fused_relu)
           sum = std::max(sum, 0);
-        }
-
         sum += output_zero_point;
-        sum = std::clamp(sum, -128, 127);
+        sum = std::min(127, std::max(-128, sum));
         batch_output[oc * patches_per_image + n] = static_cast<int8_t>(sum);
       }
     }
+  };
+
+  const int64_t total_work = batch_size * OC;
+  if (tp != nullptr) {
+    onnxruntime::concurrency::ThreadPool::TrySimpleParallelFor(
+        tp, total_work,
+        [&](int64_t work_idx) {
+          process_chunk(work_idx, work_idx + 1);
+        });
+  } else {
+    process_chunk(0, total_work);
   }
 }
+
+}  // namespace nudgev
+}  // namespace onnxruntime

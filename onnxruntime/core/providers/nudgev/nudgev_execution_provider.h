@@ -13,21 +13,81 @@
 
 namespace onnxruntime {
 
-struct alignas(32) ConvQuantParams {
-  float input_scale{};
+struct alignas(32) AddParams {
+  int64_t batch_size{};
+  int64_t channels{};
+  int64_t height{};
+  int64_t width{};
+  bool dynamic_batch{false};
+  bool fused_relu{};
+  double input1_scale{};
+  int8_t input1_zp{};
+  double input2_scale{};
+  int8_t input2_zp{};
+  double output_scale{};
+  int8_t output_zp{};
+  int32_t M1_fixed{};
+  int32_t M2_fixed{};
+};
+
+struct alignas(32) MaxPoolParams {
+  std::vector<int64_t> kernel_shape;
+  std::vector<int64_t> pads;
+  std::vector<int64_t> strides;
+  bool ceil_mode{false};
+  bool count_include_pad{false};
+  int64_t storage_order{0};
+  int64_t batch_size{};
+  bool dynamic_batch{false};
+  int64_t channels{};
+  int64_t input_height{};
+  int64_t input_width{};
+  int64_t output_height{};
+  int64_t output_width{};
+  alignas(32) std::vector<int8_t> output_buffer;
+  double input_scale{};
   int8_t input_zp{};
-  float weight_scale{};
+  double output_scale{};
+  int8_t output_zp{};
+};
+
+struct alignas(32) GemmParams {
+  double alpha{1.0f};
+  double beta{1.0f};
+  bool transA{false};
+  bool transB{false};
+  int64_t M{};
+  int64_t N{};
+  int64_t K{};
+  int64_t batch_size{};
+  bool dynamic_batch{false};
+  double input_scale{};
+  int8_t input_zp{};
+  double weight_scale{};
   int8_t weight_zp{};
-  float bias_scale{};
+  double output_scale{};
+  int8_t output_zp{};
+  int32_t M_fixed{};
+  alignas(32) std::vector<int8_t> weights_buffer;
+  alignas(32) std::vector<int32_t> bias_buffer;
+  alignas(32) std::vector<int8_t> input_centered_buffer;
+};
+
+struct alignas(32) ConvQuantParams {
+  double input_scale{};
+  int8_t input_zp{};
+  double weight_scale{};
+  int8_t weight_zp{};
+  double bias_scale{};
   int8_t bias_zp{};
-  float output_scale{};
+  double output_scale{};
   int8_t output_zp{};
 
   int64_t group{};
   bool has_bias{};
   bool fused_relu{};
   bool dynamic_batch{};
-  float M{};
+  double M{};
   int32_t M_fixed{};
   int64_t N{};
   int64_t K{};
@@ -85,10 +145,10 @@ class Memcpy final : public OpKernel {
   Status Compute(OpKernelContext* ctx) const override {
     const auto* X = ctx->Input<Tensor>(0);
     ORT_ENFORCE(X != nullptr, "Memcpy: Input tensor is nullptr.");
-    // std::cout << "[Memcpy Kernel] Input tensor shape: " << X->Shape().ToString() << std::endl;
+    std::cout << "[Memcpy Kernel] Input tensor shape: " << X->Shape().ToString() << std::endl;
     Tensor* Y = ctx->Output(0, X->Shape());
     ORT_ENFORCE(Y != nullptr, "Memcpy: Failed to allocate output tensor.");
-    // std::cout << "[Memcpy Kernel] Output tensor shape: " << Y->Shape().ToString() << std::endl;
+    std::cout << "[Memcpy Kernel] Output tensor shape: " << Y->Shape().ToString() << std::endl;
     memcpy(Y->MutableDataRaw(), X->DataRaw(), X->SizeInBytes());
 
     return Status::OK();
@@ -120,7 +180,13 @@ class NudgevExecutionProvider : public IExecutionProvider {
 
  private:
   mutable std::unordered_map<std::string, ConvQuantParams> quant_params_map_;
-  std::vector<std::unique_ptr<ConvQuantParams>> saved_params_;
+  mutable std::unordered_map<std::string, GemmParams> gemm_params_map_;
+  mutable std::unordered_map<std::string, MaxPoolParams> maxpool_params_map_;
+  mutable std::unordered_map<std::string, AddParams> add_params_map_;
+  std::vector<std::unique_ptr<ConvQuantParams>> saved_conv_params_;
+  std::vector<std::unique_ptr<GemmParams>> saved_gemm_params_;
+  std::vector<std::unique_ptr<MaxPoolParams>> saved_maxpool_params_;
+  std::vector<std::unique_ptr<AddParams>> saved_add_params_;
   std::unordered_map<std::string, std::string> node_name_mapping_;
   Status ParseProviderOptions(const ProviderOptions& provider_options_map);
   std::vector<std::unique_ptr<OpKernel>> kernels_;
