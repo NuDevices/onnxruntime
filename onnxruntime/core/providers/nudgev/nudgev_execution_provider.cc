@@ -322,15 +322,14 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
       params.output_width = static_cast<int64_t>(std::floor(
           (input_width + params.pads[1] + params.pads[3] - KW) / static_cast<double>(params.strides[1]) + 1));
 
-      const int64_t max_padded_height = input_height + params.pads[0] + params.pads[2];
-      const int64_t max_padded_width = input_width + params.pads[1] + params.pads[3];
-
       int64_t effective_batch_size = initial_batch_size;
       if (initial_batch_size == 0) {
         effective_batch_size = 16;
         params.dynamic_batch = true;
       }
 
+      const int64_t max_padded_height = input_height + params.pads[0] + params.pads[2];
+      const int64_t max_padded_width = input_width + params.pads[1] + params.pads[3];
       params.N = effective_batch_size * params.output_height * params.output_width;
       params.K = input_channels * KH * KW;
       const size_t temp_buffer_size = params.N * OC;
@@ -472,7 +471,7 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
       float M = params.input_scale * params.weight_scale / params.output_scale;
       params.M_fixed = static_cast<int32_t>(M * (1 << 15));
       params.M = params.input_scale * params.weight_scale / params.output_scale;
-
+      std::fill(params.padded_buffer.begin(), params.padded_buffer.end(), params.input_zp);
       params.node_name = node->Name();
 
       std::vector<const Node*> fused_nodes{input_dq, weight_dq, node};
@@ -541,7 +540,7 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
       const int64_t initial_batch_size = shape_proto->dim(0).dim_value();
       int64_t effective_batch_size = initial_batch_size;
       if (initial_batch_size == 0) {
-        effective_batch_size = 16;
+        effective_batch_size = 8;
         params.dynamic_batch = true;
       }
       params.batch_size = effective_batch_size;
@@ -748,7 +747,7 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
       const int64_t initial_batch_size = shape_proto->dim(0).dim_value();
       int64_t effective_batch_size = initial_batch_size;
       if (initial_batch_size == 0) {
-        effective_batch_size = 16;
+        effective_batch_size = 8;
         params.dynamic_batch = true;
       }
       params.batch_size = effective_batch_size;
@@ -873,7 +872,7 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
       params.width = shape_proto->dim(3).dim_value();
 
       if (initial_batch_size == 0) {
-        params.batch_size = 16;
+        params.batch_size = 8;
         params.dynamic_batch = true;
       } else {
         params.batch_size = initial_batch_size;
@@ -1014,7 +1013,6 @@ Status NudgevExecutionProvider::Compile(
                                      const OrtApi*,
                                      OrtKernelContext* context) -> Status {
         auto start = std::chrono::high_resolution_clock::now();
-
         if (!state) {
           return Status(common::ONNXRUNTIME, common::FAIL, "state is null");
         }
@@ -1050,7 +1048,6 @@ Status NudgevExecutionProvider::Compile(
         const int64_t input_height = input_shape[2];
         const int64_t input_width = input_shape[3];
 
-        // Gestione batch dinamico
         if (params->dynamic_batch && actual_batch_size != params->batch_size) {
           const int64_t new_N = actual_batch_size * params->output_height * params->output_width;
           params->N = new_N;
@@ -1059,13 +1056,11 @@ Status NudgevExecutionProvider::Compile(
           const int64_t max_padded_width = input_width + params->pads[1] + params->pads[3];
 
           const size_t padded_input = actual_batch_size * input_channels * max_padded_height * max_padded_width;
-          const size_t input_size = actual_batch_size * input_channels * input_height * input_width;
 
           params->padded_buffer.resize(padded_input);
-          params->input_centered_buffer.resize(input_size);
-          params->im2row_buffer.resize(params->N * params->K);
-          params->temp_buffer.resize(params->N * params->weight_shape[0]);
+          std::fill(params->padded_buffer.begin(), params->padded_buffer.end(), params->input_zp);
 
+          params->im2row_buffer.resize(params->N * params->K);
           params->batch_size = actual_batch_size;
         }
 
@@ -1099,14 +1094,12 @@ Status NudgevExecutionProvider::Compile(
                                     kernel_width,
                                     params->strides[0],
                                     params->pads,
-                                    params->input_zp,
-                                    params->input_centered_buffer.data(),
                                     params->padded_buffer.data(),
                                     tp);
 
         auto end = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-        /*
+
         std::cout << "=== Conv Op - Im2Row Debug Info ===\n";
         std::cout << "Input Shape: (" << actual_batch_size << ", " << input_channels << ", "
                   << input_height << ", " << input_width << ")\n";
@@ -1117,13 +1110,12 @@ Status NudgevExecutionProvider::Compile(
         std::cout << "Padding: (" << params->pads[0] << ", " << params->pads[1] << ")\n";
         std::cout << "Output Shape: (" << actual_batch_size << ", " << output_channels << ", "
                   << params->output_height << ", " << params->output_width << ")\n";
-        std::cout << "====================================\n";
-        */
         std::cout << "Conv Op - Im2col execution time: " << duration.count() << " microseconds" << std::endl;
-        // GEMM computation phase
+        std::cout << "====================================\n";
+
         const int64_t patches_per_image = params->output_height * params->output_width;
         auto start_gemm = std::chrono::high_resolution_clock::now();
-        onnxruntime::nudgev::gemm_i8_after_im2col(
+        onnxruntime::nudgev::gemm_i8_after_im2col_xzp(
             params->weights.data(),
             im2row_ptr,
             output_data,
@@ -1135,6 +1127,7 @@ Status NudgevExecutionProvider::Compile(
             params->has_bias,
             params->M_fixed,
             params->output_zp,
+            params->input_zp,
             params->fused_relu,
             tp);
         auto end_gemm = std::chrono::high_resolution_clock::now();
@@ -1190,7 +1183,6 @@ Status NudgevExecutionProvider::Compile(
 
         if (params->dynamic_batch && actual_batch_size != params->batch_size) {
           params->batch_size = actual_batch_size;
-          params->input_centered_buffer.resize(actual_batch_size * params->K);
         }
 
         std::vector<int64_t> output_shape{params->batch_size, params->N};
@@ -1230,7 +1222,6 @@ Status NudgevExecutionProvider::Compile(
             params->input_zp,
             params->output_zp,
             false,
-            params->input_centered_buffer.data(),
             tp);
 
         auto end_gemm = std::chrono::high_resolution_clock::now();
@@ -1375,7 +1366,6 @@ Status NudgevExecutionProvider::Compile(
 
         const auto* input1_data = input1->Data<int8_t>();
         const auto* input2_data = input2->Data<int8_t>();
-
         auto* output_data = output->MutableData<int8_t>();
 
         if (!input1_data || !input2_data || !output_data) {
@@ -1384,21 +1374,37 @@ Status NudgevExecutionProvider::Compile(
 
         concurrency::ThreadPool* tp = ctx_internal->GetOperatorThreadPool();
 
-        onnxruntime::nudgev::optimized_nudgev_add(
-            input1_data,
-            input2_data,
-            output_data,
-            params->batch_size,
-            params->channels,
-            params->height,
-            params->width,
-            params->M1_fixed,
-            params->M2_fixed,
-            params->input1_zp,
-            params->input2_zp,
-            params->output_zp,
-            params->fused_relu,
-            tp);
+        if (params->fused_relu) {
+          onnxruntime::nudgev::nudgev_add_relu(
+              input1_data,
+              input2_data,
+              output_data,
+              params->batch_size,
+              params->channels,
+              params->height,
+              params->width,
+              params->M1_fixed,
+              params->M2_fixed,
+              params->input1_zp,
+              params->input2_zp,
+              params->output_zp,
+              tp);
+        } else {
+          onnxruntime::nudgev::nudgev_add(
+              input1_data,
+              input2_data,
+              output_data,
+              params->batch_size,
+              params->channels,
+              params->height,
+              params->width,
+              params->M1_fixed,
+              params->M2_fixed,
+              params->input1_zp,
+              params->input2_zp,
+              params->output_zp,
+              tp);
+        }
 
         auto end = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
