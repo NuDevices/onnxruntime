@@ -13,7 +13,7 @@ thread_local struct {
   alignas(32) int32_t accumulators[16];
 } local_buffers;
 
-void nudgev_add(
+void nudgev_add_requantized(
     const int8_t* input_a,
     const int8_t* input_b,
     int8_t* output,
@@ -164,7 +164,7 @@ void nudgev_add(
   }
 }
 
-void nudgev_add_relu(
+void nudgev_add_relu_requantized(
     const int8_t* input_a,
     const int8_t* input_b,
     int8_t* output,
@@ -299,6 +299,106 @@ void nudgev_add_relu(
           sum = sum + output_zp;
           sum = std::min(127, std::max(-128, sum));
           output[j] = static_cast<int8_t>(sum);
+        }
+      }
+    }
+  };
+
+  const int64_t chunk_size = 4096;
+  const int64_t num_chunks = (total_elements + chunk_size - 1) / chunk_size;
+
+  if (tp != nullptr) {
+    concurrency::ThreadPool::TrySimpleParallelFor(
+        tp, num_chunks,
+        [&](std::ptrdiff_t chunk_idx) {
+          const int64_t start = chunk_idx * chunk_size;
+          const int64_t end = std::min(total_elements, start + chunk_size);
+          process_chunk(start, end);
+        });
+  } else {
+    process_chunk(0, total_elements);
+  }
+}
+
+void nudgev_add(
+    const float* input_a,
+    const float* input_b,
+    float* output,
+    int64_t batch_size,
+    int64_t channels,
+    int64_t height,
+    int64_t width,
+    onnxruntime::concurrency::ThreadPool* tp) {
+  const int64_t elements_per_batch = channels * height * width;
+  const int64_t total_elements = batch_size * elements_per_batch;
+
+  auto process_chunk = [&](int64_t start, int64_t end) {
+    for (int64_t i = start; i < end; i += 256) {
+      _mm_prefetch(reinterpret_cast<const char*>(input_a + i + 256), _MM_HINT_T0);
+      _mm_prefetch(reinterpret_cast<const char*>(input_b + i + 256), _MM_HINT_T0);
+    }
+
+    for (int64_t i = start; i < end; i += 8) {
+      if (i + 8 <= end) {
+        __m256 a = _mm256_loadu_ps(input_a + i);
+        __m256 b = _mm256_loadu_ps(input_b + i);
+        __m256 result = _mm256_add_ps(a, b);
+        _mm256_storeu_ps(output + i, result);
+      } else {
+        for (int64_t j = i; j < end; ++j) {
+          output[j] = input_a[j] + input_b[j];
+        }
+      }
+    }
+  };
+
+  const int64_t chunk_size = 4096;
+  const int64_t num_chunks = (total_elements + chunk_size - 1) / chunk_size;
+
+  if (tp != nullptr) {
+    concurrency::ThreadPool::TrySimpleParallelFor(
+        tp, num_chunks,
+        [&](std::ptrdiff_t chunk_idx) {
+          const int64_t start = chunk_idx * chunk_size;
+          const int64_t end = std::min(total_elements, start + chunk_size);
+          process_chunk(start, end);
+        });
+  } else {
+    process_chunk(0, total_elements);
+  }
+}
+
+void nudgev_add_relu(
+    const float* input_a,
+    const float* input_b,
+    float* output,
+    int64_t batch_size,
+    int64_t channels,
+    int64_t height,
+    int64_t width,
+    onnxruntime::concurrency::ThreadPool* tp) {
+  const int64_t elements_per_batch = channels * height * width;
+  const int64_t total_elements = batch_size * elements_per_batch;
+
+  const __m256 zero_vec = _mm256_setzero_ps();
+
+  auto process_chunk = [&](int64_t start, int64_t end) {
+    for (int64_t i = start; i < end; i += 256) {
+      _mm_prefetch(reinterpret_cast<const char*>(input_a + i + 256), _MM_HINT_T0);
+      _mm_prefetch(reinterpret_cast<const char*>(input_b + i + 256), _MM_HINT_T0);
+    }
+
+    for (int64_t i = start; i < end; i += 8) {
+      if (i + 8 <= end) {
+        __m256 a = _mm256_loadu_ps(input_a + i);
+        __m256 b = _mm256_loadu_ps(input_b + i);
+        __m256 sum = _mm256_add_ps(a, b);
+        __m256 result = _mm256_max_ps(sum, zero_vec);
+        _mm256_storeu_ps(output + i, result);
+      } else {
+        for (int64_t j = i; j < end; ++j) {
+          float sum = input_a[j] + input_b[j];
+          output[j] = std::max(0.0f, sum);
         }
       }
     }

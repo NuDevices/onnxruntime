@@ -3,6 +3,7 @@
 #include "core/providers/nudgev/operators/nudgev_gemm.h"
 #include "core/providers/nudgev/operators/nudgev_maxpool.h"
 #include "core/providers/nudgev/operators/nudgev_add.h"
+#include "core/providers/nudgev/operators/nudgev_sigmoid.h"
 #include "core/framework/compute_capability.h"
 #include "core/framework/kernel_registry.h"
 #include "core/framework/op_kernel.h"
@@ -25,6 +26,27 @@
 namespace onnxruntime {
 
 static void RegisterNudgevKernels(KernelRegistry& kernel_registry) {
+  {
+    KernelDefBuilder def_builder;
+    auto create_fn = [](FuncManager& func_mgr, const OpKernelInfo& info, std::unique_ptr<OpKernel>& out) -> Status {
+      ORT_UNUSED_PARAMETER(func_mgr);
+      ORT_UNUSED_PARAMETER(info);
+      ORT_UNUSED_PARAMETER(out);
+      return Status::OK();
+    };
+
+    Status status = kernel_registry.Register(
+        def_builder
+            .SetName("Sigmoid")
+            .SetDomain(kOnnxDomain)
+            .SinceVersion(1)
+            .Provider(kNudgevExecutionProvider)
+            .InputMemoryType(OrtMemTypeCPUInput, 0)
+            .OutputMemoryType(OrtMemTypeCPUOutput, 0),
+        create_fn);
+
+    ORT_ENFORCE(status.IsOK(), "Failed to register NUDGEV kernel for Sigmoid");
+  }
   {
     KernelDefBuilder def_builder;
     auto create_fn = [](FuncManager& func_mgr, const OpKernelInfo& info, std::unique_ptr<OpKernel>& out) -> Status {
@@ -62,8 +84,6 @@ static void RegisterNudgevKernels(KernelRegistry& kernel_registry) {
             .SetDomain(kOnnxDomain)
             .SinceVersion(1)
             .Provider(kNudgevExecutionProvider)
-            .TypeConstraint("X", DataTypeImpl::GetTensorType<int8_t>())
-            .TypeConstraint("Y", DataTypeImpl::GetTensorType<int8_t>())
             .InputMemoryType(OrtMemTypeCPUInput, 0)
             .OutputMemoryType(OrtMemTypeCPUOutput, 0),
         create_fn);
@@ -240,7 +260,6 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
 
     if (node->OpType() == "Conv") {
       ConvQuantParams params{};
-
       const auto& attributes = node->GetAttributes();
 
       // Check if Conv is fused with Relu
@@ -511,7 +530,6 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
       if (handled_nodes.find(node) != handled_nodes.end()) {
         continue;
       }
-
       GemmParams params{};
 
       // Get attributes
@@ -690,12 +708,61 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
 
       handled_nodes.insert(fused_nodes.begin(), fused_nodes.end());
       continue;
+    } else if (node->OpType() == "Sigmoid") {
+      if (handled_nodes.find(node) != handled_nodes.end()) {
+        continue;
+      }
+      SigmoidParams params{};
+
+      const auto* shape_proto = node->InputDefs()[0]->Shape();
+      const int64_t dims = shape_proto->dim_size();
+
+      if (dims != 3 && dims != 4) {
+        continue;
+      }
+
+      const int64_t initial_batch_size = shape_proto->dim(0).dim_value();
+      params.batch_size = initial_batch_size;
+      if (initial_batch_size == 0) {
+        params.batch_size = 8;
+        params.dynamic_batch = true;
+      }
+
+      if (dims == 4) {
+        params.channels = shape_proto->dim(1).dim_value();
+        params.height = shape_proto->dim(2).dim_value();
+        params.width = shape_proto->dim(3).dim_value();
+      } else {
+        params.channels = 1;
+        params.height = shape_proto->dim(1).dim_value();
+        params.width = shape_proto->dim(2).dim_value();
+      }
+
+      std::vector<const Node*> fused_nodes{node};
+
+      uint64_t model_hash;
+      int metadef_id = this->metadef_id_generator_.GenerateId(graph_viewer, model_hash);
+
+      auto node_name = MakeString("NudgevExecutionProvider_", model_hash, "_", metadef_id, "_", metadef_id);
+      sigmoid_params_map_[node_name] = std::move(params);
+
+      result.push_back(utils::MakeComputeCapability(
+          graph_viewer,
+          fused_nodes,
+          [model_hash, metadef_id]() {
+            return MakeString(model_hash, "_", metadef_id);
+          },
+          kNudgevExecutionProvider,
+          false));
+
+      handled_nodes.insert(fused_nodes.begin(), fused_nodes.end());
+      continue;
     } else if (node->OpType() == "MaxPool") {
       if (handled_nodes.find(node) != handled_nodes.end()) {
         continue;
       }
-
       MaxPoolParams params{};
+      params.needs_quantization = false;  // Inizializziamo il flag a false
 
       // Get attributes
       const auto& attributes = node->GetAttributes();
@@ -735,15 +802,19 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
         params.storage_order = attributes.at("storage_order").i();
       }
 
-      // Input parameters (DequantizeLinear)
+      // Input parameters check for quantization
       const Node* input_dq = graph_viewer.GetProducerNode(node->InputDefs()[0]->Name());
       if (!input_dq || input_dq->OpType() != "DequantizeLinear" ||
           handled_nodes.find(input_dq) != handled_nodes.end()) {
+        // Input is not quantized (float) or DequantizeLinear was already handled
+        // Skip this node to let it fall back to CPU execution provider
         continue;
       }
+      params.needs_quantization = true;
 
-      // Get input shape and handle dynamic batch
-      const auto* shape_proto = input_dq->InputDefs()[0]->Shape();
+      // Get input shape
+      const auto* shape_proto = params.needs_quantization ? input_dq->InputDefs()[0]->Shape() : node->InputDefs()[0]->Shape();
+
       const int64_t initial_batch_size = shape_proto->dim(0).dim_value();
       int64_t effective_batch_size = initial_batch_size;
       if (initial_batch_size == 0) {
@@ -767,47 +838,48 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
               static_cast<double>(params.strides[1]) +
           1));
 
-      // Get input quantization parameters
-      const auto& input_qparams = input_dq->InputDefs();
-      const auto* input_scale_init = initializers.at(input_qparams[1]->Name());
-      const auto* input_zp_init = initializers.at(input_qparams[2]->Name());
+      if (params.needs_quantization) {
+        // Get input quantization parameters
+        const auto& input_qparams = input_dq->InputDefs();
+        const auto* input_scale_init = initializers.at(input_qparams[1]->Name());
+        const auto* input_zp_init = initializers.at(input_qparams[2]->Name());
 
-      if (input_scale_init->has_raw_data()) {
-        params.input_scale = *reinterpret_cast<const float*>(input_scale_init->raw_data().data());
-      } else {
-        params.input_scale = input_scale_init->float_data().empty() ? 0.0f : input_scale_init->float_data(0);
-      }
-
-      if (input_zp_init->has_raw_data()) {
-        params.input_zp = *reinterpret_cast<const int8_t*>(input_zp_init->raw_data().data());
-      } else {
-        params.input_zp = static_cast<int8_t>(input_zp_init->int32_data().empty() ? 0 : input_zp_init->int32_data(0));
-      }
-
-      // Get output quantization parameters
-      const Node* output_q = nullptr;
-      auto maxpool_consumers = graph_viewer.GetConsumerNodes(node->OutputDefs()[0]->Name());
-      if (!maxpool_consumers.empty()) {
-        output_q = maxpool_consumers[0];
-        if (output_q && output_q->OpType() == "QuantizeLinear") {
-          const auto& output_qparams = output_q->InputDefs();
-          const auto* output_scale_init = initializers.at(output_qparams[1]->Name());
-          const auto* output_zp_init = initializers.at(output_qparams[2]->Name());
-
-          if (output_scale_init->has_raw_data()) {
-            params.output_scale = *reinterpret_cast<const float*>(output_scale_init->raw_data().data());
-          } else {
-            params.output_scale = output_scale_init->float_data().empty() ? 0.0f : output_scale_init->float_data(0);
-          }
-
-          if (output_zp_init->has_raw_data()) {
-            params.output_zp = *reinterpret_cast<const int8_t*>(output_zp_init->raw_data().data());
-          } else {
-            params.output_zp = static_cast<int8_t>(output_zp_init->int32_data().empty() ? 0 : output_zp_init->int32_data(0));
-          }
-
+        if (input_scale_init->has_raw_data()) {
+          params.input_scale = *reinterpret_cast<const float*>(input_scale_init->raw_data().data());
         } else {
-          continue;
+          params.input_scale = input_scale_init->float_data().empty() ? 0.0f : input_scale_init->float_data(0);
+        }
+
+        if (input_zp_init->has_raw_data()) {
+          params.input_zp = *reinterpret_cast<const int8_t*>(input_zp_init->raw_data().data());
+        } else {
+          params.input_zp = static_cast<int8_t>(input_zp_init->int32_data().empty() ? 0 : input_zp_init->int32_data(0));
+        }
+
+        // Check output quantization
+        const Node* output_q = nullptr;
+        auto maxpool_consumers = graph_viewer.GetConsumerNodes(node->OutputDefs()[0]->Name());
+        if (!maxpool_consumers.empty()) {
+          output_q = maxpool_consumers[0];
+          if (output_q && output_q->OpType() == "QuantizeLinear") {
+            const auto& output_qparams = output_q->InputDefs();
+            const auto* output_scale_init = initializers.at(output_qparams[1]->Name());
+            const auto* output_zp_init = initializers.at(output_qparams[2]->Name());
+
+            if (output_scale_init->has_raw_data()) {
+              params.output_scale = *reinterpret_cast<const float*>(output_scale_init->raw_data().data());
+            } else {
+              params.output_scale = output_scale_init->float_data().empty() ? 0.0f : output_scale_init->float_data(0);
+            }
+
+            if (output_zp_init->has_raw_data()) {
+              params.output_zp = *reinterpret_cast<const int8_t*>(output_zp_init->raw_data().data());
+            } else {
+              params.output_zp = static_cast<int8_t>(output_zp_init->int32_data().empty() ? 0 : output_zp_init->int32_data(0));
+            }
+          } else {
+            continue;
+          }
         }
       }
 
@@ -816,9 +888,17 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
       params.output_buffer.resize(output_size);
 
       // Create and save the node info
-      std::vector<const Node*> fused_nodes{input_dq, node};
-      if (output_q && output_q->OpType() == "QuantizeLinear") {
-        fused_nodes.push_back(output_q);
+      std::vector<const Node*> fused_nodes;
+      if (params.needs_quantization) {
+        fused_nodes.push_back(input_dq);
+      }
+      fused_nodes.push_back(node);
+
+      if (params.needs_quantization) {
+        const Node* output_q = graph_viewer.GetConsumerNodes(node->OutputDefs()[0]->Name())[0];
+        if (output_q && output_q->OpType() == "QuantizeLinear") {
+          fused_nodes.push_back(output_q);
+        }
       }
 
       uint64_t model_hash;
@@ -845,31 +925,81 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
       }
 
       AddParams params{};
+      params.needs_quantization = false;
+      params.has_constant = false;
 
       // Check if Add is fused with Relu
       std::string add_output_name = node->OutputDefs()[0]->Name();
       bool has_relu = add_output_name.find("Relu") != std::string::npos;
       params.fused_relu = has_relu;
 
+      // Controllo sugli input e sulla quantizzazione
       const Node* input1_dq = graph_viewer.GetProducerNode(node->InputDefs()[0]->Name());
       const Node* input2_dq = graph_viewer.GetProducerNode(node->InputDefs()[1]->Name());
+      const auto* input1_shape = node->InputDefs()[0]->Shape();
+      const auto* input2_shape = node->InputDefs()[1]->Shape();
+      // Verifica se uno degli input ha una singola dimensione (quindi è costante)
+      bool input1_is_constant = input1_shape && input1_shape->dim_size() == 1;
+      bool input2_is_constant = input2_shape && input2_shape->dim_size() == 1;
 
-      if (!input1_dq || !input2_dq ||
-          input1_dq->OpType() != "DequantizeLinear" ||
-          input2_dq->OpType() != "DequantizeLinear") {
-        continue;
+      if (input1_is_constant || input2_is_constant) {
+        params.has_constant = true;
+        params.constant_is_first_input = input1_is_constant;
+
+        const auto* constant_tensor = initializers.at(
+            params.constant_is_first_input ? node->InputDefs()[0]->Name() : node->InputDefs()[1]->Name());
+
+        if (constant_tensor->data_type() == ONNX_NAMESPACE::TensorProto_DataType_INT64) {
+          params.constant_value = constant_tensor->int64_data(0);
+        } else {
+          continue;  // Non supportiamo altri tipi di costanti
+        }
+
+        // Verifica se l'input non costante è quantizzato
+        const Node* input_dq = params.constant_is_first_input ? input2_dq : input1_dq;
+        if (input_dq && input_dq->OpType() == "DequantizeLinear") {
+          params.needs_quantization = true;
+        }
+      } else {
+        // Verifica se entrambi gli input sono quantizzati
+        if (input1_dq && input2_dq &&
+            input1_dq->OpType() == "DequantizeLinear" &&
+            input2_dq->OpType() == "DequantizeLinear") {
+          params.needs_quantization = true;
+        }
       }
 
-      // Get input shape from DequantizeLinear
-      const auto* shape_proto = input1_dq->InputDefs()[0]->Shape();
+      // Get input shape based on the scenario
+      const ONNX_NAMESPACE::TensorShapeProto* shape_proto = nullptr;
+      if (params.has_constant) {
+        // Se c'è una costante, prendiamo lo shape dell'altro input
+        const Node* non_constant_node = params.constant_is_first_input ? (params.needs_quantization ? input2_dq : nullptr) : (params.needs_quantization ? input1_dq : nullptr);
+
+        shape_proto = params.needs_quantization ? non_constant_node->InputDefs()[0]->Shape() : node->InputDefs()[params.constant_is_first_input ? 1 : 0]->Shape();
+      } else {
+        // Caso normale senza costanti
+        shape_proto = params.needs_quantization ? input1_dq->InputDefs()[0]->Shape() : node->InputDefs()[0]->Shape();
+      }
+
       if (!shape_proto) {
         continue;
       }
 
-      const int64_t initial_batch_size = shape_proto->dim(0).dim_value();
-      params.channels = shape_proto->dim(1).dim_value();
-      params.height = shape_proto->dim(2).dim_value();
-      params.width = shape_proto->dim(3).dim_value();
+      int64_t initial_batch_size;  // Dichiarato fuori dagli scope
+
+      if (shape_proto->dim_size() == 4) {
+        initial_batch_size = shape_proto->dim(0).dim_value();
+        params.channels = shape_proto->dim(1).dim_value();
+        params.height = shape_proto->dim(2).dim_value();
+        params.width = shape_proto->dim(3).dim_value();
+      } else if (shape_proto->dim_size() == 3) {
+        initial_batch_size = shape_proto->dim(0).dim_value();
+        params.channels = 1;  // Assumiamo 1 canale
+        params.height = shape_proto->dim(1).dim_value();
+        params.width = shape_proto->dim(2).dim_value();
+      } else {
+        continue;
+      }
 
       if (initial_batch_size == 0) {
         params.batch_size = 8;
@@ -878,91 +1008,154 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
         params.batch_size = initial_batch_size;
       }
 
-      // Get input1 quantization parameters from DequantizeLinear
-      const auto* input1_scale_init = initializers.at(input1_dq->InputDefs()[1]->Name());
-      const auto* input1_zp_init = initializers.at(input1_dq->InputDefs()[2]->Name());
-
-      if (!input1_scale_init || !input1_zp_init) {
-        continue;
-      }
-
-      if (input1_scale_init->has_raw_data()) {
-        params.input1_scale = *reinterpret_cast<const double*>(input1_scale_init->raw_data().data());
-      } else if (input1_scale_init->data_type() == ONNX_NAMESPACE::TensorProto_DataType_FLOAT) {
-        params.input1_scale = input1_scale_init->float_data().empty() ? 0.0f : input1_scale_init->float_data(0);
+      if (initial_batch_size == 0) {
+        params.batch_size = 8;
+        params.dynamic_batch = true;
       } else {
-        params.input1_scale = 0.0f;
-      }
-      if (input1_zp_init->has_raw_data()) {
-        params.input1_zp = *reinterpret_cast<const int8_t*>(input1_zp_init->raw_data().data());
-      } else if (input1_zp_init->data_type() == ONNX_NAMESPACE::TensorProto_DataType_INT8) {
-        params.input1_zp = input1_zp_init->int32_data().empty() ? 0 : static_cast<int8_t>(input1_zp_init->int32_data(0));
-      } else {
-        params.input1_zp = 0;
+        params.batch_size = initial_batch_size;
       }
 
-      // Get input2 quantization parameters from DequantizeLinear
-      const auto* input2_scale_init = initializers.at(input2_dq->InputDefs()[1]->Name());
-      const auto* input2_zp_init = initializers.at(input2_dq->InputDefs()[2]->Name());
+      if (params.needs_quantization) {
+        if (params.has_constant) {
+          // Get input quantization parameters
+          const Node* input_dq = params.constant_is_first_input ? input2_dq : input1_dq;
+          const auto* input_scale_init = initializers.at(input_dq->InputDefs()[1]->Name());
+          const auto* input_zp_init = initializers.at(input_dq->InputDefs()[2]->Name());
 
-      if (!input2_scale_init || !input2_zp_init) {
-        continue;
-      }
-
-      if (input2_scale_init->has_raw_data()) {
-        params.input2_scale = *reinterpret_cast<const float*>(input2_scale_init->raw_data().data());
-      } else if (input2_scale_init->data_type() == ONNX_NAMESPACE::TensorProto_DataType_FLOAT) {
-        params.input2_scale = input2_scale_init->float_data().empty() ? 0.0f : input2_scale_init->float_data(0);
-      } else {
-        params.input2_scale = 0.0f;
-      }
-      if (input2_zp_init->has_raw_data()) {
-        params.input2_zp = *reinterpret_cast<const int8_t*>(input2_zp_init->raw_data().data());
-      } else if (input2_zp_init->data_type() == ONNX_NAMESPACE::TensorProto_DataType_INT8) {
-        params.input2_zp = input2_zp_init->int32_data().empty() ? 0 : static_cast<int8_t>(input2_zp_init->int32_data(0));
-      } else {
-        params.input2_zp = 0;
-      }
-
-      // Get output quantization parameters from QuantizeLinear
-      const Node* output_q = nullptr;
-      auto add_consumers = graph_viewer.GetConsumerNodes(node->OutputDefs()[0]->Name());
-
-      if (!add_consumers.empty()) {
-        output_q = add_consumers[0];
-        if (output_q && output_q->OpType() == "QuantizeLinear") {
-          const auto* output_scale_init = initializers.at(output_q->InputDefs()[1]->Name());
-          const auto* output_zp_init = initializers.at(output_q->InputDefs()[2]->Name());
-
-          if (!output_scale_init || !output_zp_init) {
+          if (!input_scale_init || !input_zp_init) {
             continue;
           }
 
-          if (output_scale_init->has_raw_data()) {
-            params.output_scale = *reinterpret_cast<const float*>(output_scale_init->raw_data().data());
-          } else if (output_scale_init->data_type() == ONNX_NAMESPACE::TensorProto_DataType_FLOAT) {
-            params.output_scale = output_scale_init->float_data().empty() ? 0.0f : output_scale_init->float_data(0);
+          if (input_scale_init->has_raw_data()) {
+            params.input1_scale = *reinterpret_cast<const float*>(input_scale_init->raw_data().data());
+          } else if (input_scale_init->data_type() == ONNX_NAMESPACE::TensorProto_DataType_FLOAT) {
+            params.input1_scale = input_scale_init->float_data().empty() ? 0.0f : input_scale_init->float_data(0);
           } else {
-            params.output_scale = 0.0f;
+            params.input1_scale = 0.0f;
           }
-          if (output_zp_init->has_raw_data()) {
-            params.output_zp = *reinterpret_cast<const int8_t*>(output_zp_init->raw_data().data());
-          } else if (output_zp_init->data_type() == ONNX_NAMESPACE::TensorProto_DataType_INT8) {
-            params.output_zp = output_zp_init->int32_data().empty() ? 0 : static_cast<int8_t>(output_zp_init->int32_data(0));
+
+          if (input_zp_init->has_raw_data()) {
+            params.input1_zp = *reinterpret_cast<const int8_t*>(input_zp_init->raw_data().data());
+          } else if (input_zp_init->data_type() == ONNX_NAMESPACE::TensorProto_DataType_INT8) {
+            params.input1_zp = input_zp_init->int32_data().empty() ? 0 : static_cast<int8_t>(input_zp_init->int32_data(0));
           } else {
-            params.output_zp = 0;
+            params.input1_zp = 0;
+          }
+        } else {
+          // Get input1 quantization parameters
+          const auto* input1_scale_init = initializers.at(input1_dq->InputDefs()[1]->Name());
+          const auto* input1_zp_init = initializers.at(input1_dq->InputDefs()[2]->Name());
+
+          if (!input1_scale_init || !input1_zp_init) {
+            continue;
+          }
+
+          if (input1_scale_init->has_raw_data()) {
+            params.input1_scale = *reinterpret_cast<const float*>(input1_scale_init->raw_data().data());
+          } else if (input1_scale_init->data_type() == ONNX_NAMESPACE::TensorProto_DataType_FLOAT) {
+            params.input1_scale = input1_scale_init->float_data().empty() ? 0.0f : input1_scale_init->float_data(0);
+          } else {
+            params.input1_scale = 0.0f;
+          }
+
+          if (input1_zp_init->has_raw_data()) {
+            params.input1_zp = *reinterpret_cast<const int8_t*>(input1_zp_init->raw_data().data());
+          } else if (input1_zp_init->data_type() == ONNX_NAMESPACE::TensorProto_DataType_INT8) {
+            params.input1_zp = input1_zp_init->int32_data().empty() ? 0 : static_cast<int8_t>(input1_zp_init->int32_data(0));
+          } else {
+            params.input1_zp = 0;
+          }
+
+          // Get input2 quantization parameters
+          const auto* input2_scale_init = initializers.at(input2_dq->InputDefs()[1]->Name());
+          const auto* input2_zp_init = initializers.at(input2_dq->InputDefs()[2]->Name());
+
+          if (!input2_scale_init || !input2_zp_init) {
+            continue;
+          }
+
+          if (input2_scale_init->has_raw_data()) {
+            params.input2_scale = *reinterpret_cast<const float*>(input2_scale_init->raw_data().data());
+          } else if (input2_scale_init->data_type() == ONNX_NAMESPACE::TensorProto_DataType_FLOAT) {
+            params.input2_scale = input2_scale_init->float_data().empty() ? 0.0f : input2_scale_init->float_data(0);
+          } else {
+            params.input2_scale = 0.0f;
+          }
+
+          if (input2_zp_init->has_raw_data()) {
+            params.input2_zp = *reinterpret_cast<const int8_t*>(input2_zp_init->raw_data().data());
+          } else if (input2_zp_init->data_type() == ONNX_NAMESPACE::TensorProto_DataType_INT8) {
+            params.input2_zp = input2_zp_init->int32_data().empty() ? 0 : static_cast<int8_t>(input2_zp_init->int32_data(0));
+          } else {
+            params.input2_zp = 0;
           }
         }
-      }
-      double M1 = params.input1_scale / params.output_scale;
-      double M2 = params.input2_scale / params.output_scale;
-      params.M1_fixed = static_cast<int32_t>(M1 * (1 << 24));
-      params.M2_fixed = static_cast<int32_t>(M2 * (1 << 24));
 
-      std::vector<const Node*>
-          fused_nodes{input1_dq, input2_dq, node};
-      if (output_q && output_q->OpType() == "QuantizeLinear") {
-        fused_nodes.push_back(output_q);
+        // Get output quantization parameters
+        const Node* output_q = nullptr;
+        auto add_consumers = graph_viewer.GetConsumerNodes(node->OutputDefs()[0]->Name());
+
+        if (!add_consumers.empty()) {
+          output_q = add_consumers[0];
+          if (output_q && output_q->OpType() == "QuantizeLinear") {
+            const auto* output_scale_init = initializers.at(output_q->InputDefs()[1]->Name());
+            const auto* output_zp_init = initializers.at(output_q->InputDefs()[2]->Name());
+
+            if (!output_scale_init || !output_zp_init) {
+              continue;
+            }
+
+            if (output_scale_init->has_raw_data()) {
+              params.output_scale = *reinterpret_cast<const float*>(output_scale_init->raw_data().data());
+            } else if (output_scale_init->data_type() == ONNX_NAMESPACE::TensorProto_DataType_FLOAT) {
+              params.output_scale = output_scale_init->float_data().empty() ? 0.0f : output_scale_init->float_data(0);
+            } else {
+              params.output_scale = 0.0f;
+            }
+
+            if (output_zp_init->has_raw_data()) {
+              params.output_zp = *reinterpret_cast<const int8_t*>(output_zp_init->raw_data().data());
+            } else if (output_zp_init->data_type() == ONNX_NAMESPACE::TensorProto_DataType_INT8) {
+              params.output_zp = output_zp_init->int32_data().empty() ? 0 : static_cast<int8_t>(output_zp_init->int32_data(0));
+            } else {
+              params.output_zp = 0;
+            }
+          }
+        }
+
+        // Calcola i moltiplicatori fissi
+        if (params.has_constant) {
+          double M = params.input1_scale / params.output_scale;
+          params.M1_fixed = static_cast<int32_t>(M * (1 << 24));
+        } else {
+          double M1 = params.input1_scale / params.output_scale;
+          double M2 = params.input2_scale / params.output_scale;
+          params.M1_fixed = static_cast<int32_t>(M1 * (1 << 24));
+          params.M2_fixed = static_cast<int32_t>(M2 * (1 << 24));
+        }
+      }
+
+      // Create and save the node info
+      std::vector<const Node*> fused_nodes;
+      if (params.needs_quantization) {
+        if (params.has_constant) {
+          // Solo un input è DequantizeLinear
+          const Node* input_dq = graph_viewer.GetProducerNode(
+              node->InputDefs()[params.constant_is_first_input ? 1 : 0]->Name());
+          fused_nodes.push_back(input_dq);
+        } else {
+          // Entrambi gli input sono DequantizeLinear
+          fused_nodes.push_back(input1_dq);
+          fused_nodes.push_back(input2_dq);
+        }
+      }
+      fused_nodes.push_back(node);
+
+      if (params.needs_quantization) {
+        const Node* output_q = graph_viewer.GetConsumerNodes(node->OutputDefs()[0]->Name())[0];
+        if (output_q && output_q->OpType() == "QuantizeLinear") {
+          fused_nodes.push_back(output_q);
+        }
       }
 
       uint64_t model_hash;
@@ -1100,19 +1293,6 @@ Status NudgevExecutionProvider::Compile(
         auto end = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
 
-        std::cout << "=== Conv Op - Im2Row Debug Info ===\n";
-        std::cout << "Input Shape: (" << actual_batch_size << ", " << input_channels << ", "
-                  << input_height << ", " << input_width << ")\n";
-        std::cout << "Im2Row Output Shape: [" << params->N << " x " << params->K << "]" << std::endl;
-        std::cout << "Weights Shape (2D): [" << params->K << " x " << output_channels << "]" << std::endl;
-        std::cout << "Kernel Size: (" << kernel_height << "x" << kernel_width << ")\n";
-        std::cout << "Stride: (" << params->strides[0] << ", " << params->strides[1] << ")\n";
-        std::cout << "Padding: (" << params->pads[0] << ", " << params->pads[1] << ")\n";
-        std::cout << "Output Shape: (" << actual_batch_size << ", " << output_channels << ", "
-                  << params->output_height << ", " << params->output_width << ")\n";
-        std::cout << "Conv Op - Im2col execution time: " << duration.count() << " microseconds" << std::endl;
-        std::cout << "====================================\n";
-
         const int64_t patches_per_image = params->output_height * params->output_width;
         auto start_gemm = std::chrono::high_resolution_clock::now();
         onnxruntime::nudgev::gemm_i8_after_im2col_xzp(
@@ -1132,11 +1312,27 @@ Status NudgevExecutionProvider::Compile(
             tp);
         auto end_gemm = std::chrono::high_resolution_clock::now();
         auto duration_gemm = std::chrono::duration_cast<std::chrono::microseconds>(end_gemm - start_gemm);
-        std::cout << "Conv Op - Total Gemm execution time: " << duration_gemm.count() << " microseconds" << std::endl;
+
         auto total_end = std::chrono::high_resolution_clock::now();
         auto total_duration = std::chrono::duration_cast<std::chrono::microseconds>(total_end - start);
-        std::cout << "Conv Op - Total execution time: " << total_duration.count() << " microseconds" << std::endl;
 
+        std::cout << "=== Conv Op - Im2col Debug Info ===\n";
+        std::cout << "Input Shape: (" << actual_batch_size << ", " << input_channels << ", "
+                  << input_height << ", " << input_width << ")\n";
+        std::cout << "Im2col Output Shape: [" << params->K << " x " << params->N << "]" << std::endl;
+        std::cout << "Weights Shape (2D): [" << output_channels << " x " << params->K << "]" << std::endl;
+        std::cout << "Kernel Size: (" << kernel_height << "x" << kernel_width << ")\n";
+        std::cout << "Stride: (" << params->strides[0] << ", " << params->strides[1] << ")\n";
+        std::cout << "Padding: (" << params->pads[0] << ", " << params->pads[1] << ")\n";
+        std::cout << "Output Shape: (" << actual_batch_size << ", " << output_channels << ", "
+                  << params->output_height << ", " << params->output_width << ")\n";
+        std::cout << "Quantization Params:\n";
+        std::cout << "  Input Scale: " << params->input_scale << "\n";
+        std::cout << "  Output Scale: " << params->output_scale << "\n";
+        std::cout << "Conv Op - Im2col execution time: " << duration.count() << " microseconds" << std::endl;
+        std::cout << "Conv Op - Total Gemm execution time: " << duration_gemm.count() << " microseconds" << std::endl;
+        std::cout << "Conv Op - Total execution time: " << total_duration.count() << " microseconds" << std::endl;
+        std::cout << "====================================\n";
         return Status::OK();
       };
 
@@ -1283,46 +1479,142 @@ Status NudgevExecutionProvider::Compile(
           return Status(common::ONNXRUNTIME, common::FAIL, "failed to create output tensor");
         }
 
-        if (Y->DataType() != DataTypeImpl::GetType<int8_t>()) {
-          return Status(common::ONNXRUNTIME, common::FAIL, "Output type must be int8");
-        }
+        if (params->needs_quantization) {
+          // Caso quantizzato (int8)
+          if (Y->DataType() != DataTypeImpl::GetType<int8_t>()) {
+            return Status(common::ONNXRUNTIME, common::FAIL, "Output type must be int8 for quantized version");
+          }
 
-        // Get data pointers
-        const auto* input_data = input->Data<int8_t>();
-        auto* output_data = Y->MutableData<int8_t>();
+          const auto* input_data = input->Data<int8_t>();
+          auto* output_data = Y->MutableData<int8_t>();
 
-        if (!input_data) {
-          return Status(common::ONNXRUNTIME, common::FAIL, "Input data is null");
-        }
-        if (!output_data) {
-          return Status(common::ONNXRUNTIME, common::FAIL, "Output data is null");
-        }
+          if (!input_data) {
+            return Status(common::ONNXRUNTIME, common::FAIL, "Input data is null");
+          }
+          if (!output_data) {
+            return Status(common::ONNXRUNTIME, common::FAIL, "Output data is null");
+          }
 
-        // Execute MaxPool
-        onnxruntime::nudgev::nudgev_maxpool(
-            input_data,
-            output_data,
-            actual_batch_size,
-            params->channels,
-            params->input_height,
-            params->input_width,
-            params->kernel_shape[0],
-            params->kernel_shape[1],
-            params->strides[0],
-            params->strides[1],
-            params->pads,
-            params->ceil_mode,
-            tp);
+          onnxruntime::nudgev::nudgev_maxpool_requantized(
+              input_data,
+              output_data,
+              actual_batch_size,
+              params->channels,
+              params->input_height,
+              params->input_width,
+              params->kernel_shape[0],
+              params->kernel_shape[1],
+              params->strides[0],
+              params->strides[1],
+              params->pads,
+              params->ceil_mode,
+              tp);
+        } else {
+          // Caso non quantizzato (float)
+          if (Y->DataType() != DataTypeImpl::GetType<float>()) {
+            return Status(common::ONNXRUNTIME, common::FAIL, "Output type must be float for non-quantized version");
+          }
+
+          const auto* input_data = input->Data<float>();
+          auto* output_data = Y->MutableData<float>();
+
+          if (!input_data) {
+            return Status(common::ONNXRUNTIME, common::FAIL, "Input data is null");
+          }
+          if (!output_data) {
+            return Status(common::ONNXRUNTIME, common::FAIL, "Output data is null");
+          }
+
+          onnxruntime::nudgev::nudgev_maxpool(
+              input_data,
+              output_data,
+              actual_batch_size,
+              params->channels,
+              params->input_height,
+              params->input_width,
+              params->kernel_shape[0],
+              params->kernel_shape[1],
+              params->strides[0],
+              params->strides[1],
+              params->pads,
+              params->ceil_mode,
+              tp);
+        }
 
         auto end = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-        std::cout << "[DEBUG] MaxPool Op - Total execution time: " << duration.count()
+        std::cout << "[DEBUG] MaxPool Op (" << (params->needs_quantization ? "quantized" : "float")
+                  << ") - Total execution time: " << duration.count()
                   << " microseconds" << std::endl;
 
         return Status::OK();
       };
 
       saved_maxpool_params_.push_back(std::move(kernel_params));
+    } else if (sigmoid_params_map_.find(fused_node.Name()) != sigmoid_params_map_.end()) {
+      auto it = sigmoid_params_map_.find(fused_node.Name());
+      if (it == sigmoid_params_map_.end()) {
+        return Status(common::ONNXRUNTIME, common::FAIL, "Sigmoid parameters not found");
+      }
+
+      auto kernel_params = std::make_unique<SigmoidParams>(std::move(it->second));
+      auto params_copy = kernel_params.get();
+
+      compute_info.create_state_func = [params_copy](ComputeContext*, FunctionState* state) {
+        *state = params_copy;
+        return 0;
+      };
+
+      compute_info.release_state_func = [](FunctionState) {};
+
+      compute_info.compute_func = [](FunctionState state,
+                                     const OrtApi*,
+                                     OrtKernelContext* context) -> Status {
+        auto start = std::chrono::high_resolution_clock::now();
+        auto* params = static_cast<SigmoidParams*>(state);
+        auto* ctx_internal = reinterpret_cast<OpKernelContextInternal*>(context);
+        const Tensor* input = ctx_internal->Input<Tensor>(0);
+        if (!input) {
+          return Status(common::ONNXRUNTIME, common::FAIL, "Input tensor is null");
+        }
+
+        const auto& input_shape = input->Shape();
+        const int64_t actual_batch_size = input_shape[0];
+
+        if (params->dynamic_batch) {
+          params->batch_size = actual_batch_size;
+        }
+
+        Tensor* output = ctx_internal->Output(0, input_shape);
+        if (!output) {
+          return Status(common::ONNXRUNTIME, common::FAIL, "Failed to create output tensor");
+        }
+
+        const auto* input_data = input->Data<float>();
+        auto* output_data = output->MutableData<float>();
+
+        if (!input_data || !output_data) {
+          return Status(common::ONNXRUNTIME, common::FAIL, "Input/Output data is null");
+        }
+
+        concurrency::ThreadPool* tp = ctx_internal->GetOperatorThreadPool();
+        onnxruntime::nudgev::nudgev_sigmoid(
+            input_data,
+            output_data,
+            actual_batch_size,
+            params->channels,
+            params->height,
+            params->width,
+            tp);
+        auto end = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+        std::cout << "Sigmoid Op - Total execution time: " << duration.count() << " microseconds" << std::endl;
+
+        return Status::OK();
+      };
+
+      saved_sigmoid_params_.push_back(std::move(kernel_params));
+
     } else if (add_params_map_.find(fused_node.Name()) != add_params_map_.end()) {
       auto it = add_params_map_.find(fused_node.Name());
       if (it == add_params_map_.end()) {
@@ -1346,7 +1638,7 @@ Status NudgevExecutionProvider::Compile(
         auto* params = static_cast<AddParams*>(state);
         auto* ctx_internal = reinterpret_cast<OpKernelContextInternal*>(context);
         const Tensor* input1 = ctx_internal->Input<Tensor>(0);
-        const Tensor* input2 = ctx_internal->Input<Tensor>(3);
+        const Tensor* input2 = ctx_internal->Input<Tensor>(params->needs_quantization ? 3 : 1);
 
         if (!input1 || !input2) {
           return Status(common::ONNXRUNTIME, common::FAIL, "Input tensors cannot be null");
@@ -1364,46 +1656,80 @@ Status NudgevExecutionProvider::Compile(
           return Status(common::ONNXRUNTIME, common::FAIL, "Failed to create output tensor");
         }
 
-        const auto* input1_data = input1->Data<int8_t>();
-        const auto* input2_data = input2->Data<int8_t>();
-        auto* output_data = output->MutableData<int8_t>();
-
-        if (!input1_data || !input2_data || !output_data) {
-          return Status(common::ONNXRUNTIME, common::FAIL, "Tensor data pointers cannot be null");
-        }
-
         concurrency::ThreadPool* tp = ctx_internal->GetOperatorThreadPool();
 
-        if (params->fused_relu) {
-          onnxruntime::nudgev::nudgev_add_relu(
-              input1_data,
-              input2_data,
-              output_data,
-              params->batch_size,
-              params->channels,
-              params->height,
-              params->width,
-              params->M1_fixed,
-              params->M2_fixed,
-              params->input1_zp,
-              params->input2_zp,
-              params->output_zp,
-              tp);
+        if (params->needs_quantization) {
+          // Versione quantizzata
+          const auto* input1_data = input1->Data<int8_t>();
+          const auto* input2_data = input2->Data<int8_t>();
+          auto* output_data = output->MutableData<int8_t>();
+
+          if (!input1_data || !input2_data || !output_data) {
+            return Status(common::ONNXRUNTIME, common::FAIL, "Tensor data pointers cannot be null");
+          }
+
+          if (params->fused_relu) {
+            onnxruntime::nudgev::nudgev_add_relu_requantized(
+                input1_data,
+                input2_data,
+                output_data,
+                params->batch_size,
+                params->channels,
+                params->height,
+                params->width,
+                params->M1_fixed,
+                params->M2_fixed,
+                params->input1_zp,
+                params->input2_zp,
+                params->output_zp,
+                tp);
+          } else {
+            onnxruntime::nudgev::nudgev_add_requantized(
+                input1_data,
+                input2_data,
+                output_data,
+                params->batch_size,
+                params->channels,
+                params->height,
+                params->width,
+                params->M1_fixed,
+                params->M2_fixed,
+                params->input1_zp,
+                params->input2_zp,
+                params->output_zp,
+                tp);
+          }
         } else {
-          onnxruntime::nudgev::nudgev_add(
-              input1_data,
-              input2_data,
-              output_data,
-              params->batch_size,
-              params->channels,
-              params->height,
-              params->width,
-              params->M1_fixed,
-              params->M2_fixed,
-              params->input1_zp,
-              params->input2_zp,
-              params->output_zp,
-              tp);
+          // Versione non quantizzata
+          const auto* input1_data = input1->Data<float>();
+          const auto* input2_data = input2->Data<float>();
+          auto* output_data = output->MutableData<float>();
+
+          if (!input1_data || !input2_data || !output_data) {
+            return Status(common::ONNXRUNTIME, common::FAIL, "Tensor data pointers cannot be null");
+          }
+
+          if (params->fused_relu) {
+            onnxruntime::nudgev::nudgev_add_relu(
+                input1_data,
+                input2_data,
+                output_data,
+                params->batch_size,
+                params->channels,
+                params->height,
+                params->width,
+                tp);
+          } else {
+            onnxruntime::nudgev::nudgev_add(
+                input1_data,
+                input2_data,
+                output_data,
+                params->batch_size,
+                params->channels,
+                params->height,
+                params->width,
+                tp);
+          }
         }
 
         auto end = std::chrono::high_resolution_clock::now();
@@ -1411,7 +1737,6 @@ Status NudgevExecutionProvider::Compile(
         std::cout << "Add Op - Total execution time: " << duration.count() << " microseconds" << std::endl;
         return Status::OK();
       };
-
       saved_add_params_.push_back(std::move(kernel_params));
     }
 

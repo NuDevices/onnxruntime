@@ -13,6 +13,13 @@
 
 namespace onnxruntime {
 
+struct alignas(32) SigmoidParams {
+  int64_t batch_size{};
+  int64_t channels{};
+  int64_t height{};
+  int64_t width{};
+  bool dynamic_batch{false};
+};
 struct alignas(32) AddParams {
   int64_t batch_size{};
   int64_t channels{};
@@ -20,6 +27,10 @@ struct alignas(32) AddParams {
   int64_t width{};
   bool dynamic_batch{false};
   bool fused_relu{};
+  bool needs_quantization;
+  bool has_constant;
+  bool constant_is_first_input;
+  int64_t constant_value;
   double input1_scale{};
   int8_t input1_zp{};
   double input2_scale{};
@@ -36,6 +47,7 @@ struct alignas(32) MaxPoolParams {
   std::vector<int64_t> strides;
   bool ceil_mode{false};
   bool count_include_pad{false};
+  bool needs_quantization{false};
   int64_t storage_order{0};
   int64_t batch_size{};
   bool dynamic_batch{false};
@@ -145,10 +157,10 @@ class Memcpy final : public OpKernel {
   Status Compute(OpKernelContext* ctx) const override {
     const auto* X = ctx->Input<Tensor>(0);
     ORT_ENFORCE(X != nullptr, "Memcpy: Input tensor is nullptr.");
-    std::cout << "[Memcpy Kernel] Input tensor shape: " << X->Shape().ToString() << std::endl;
+    std::cout << "[MEMCPY Kernel] Input tensor shape: " << X->Shape().ToString() << std::endl;
     Tensor* Y = ctx->Output(0, X->Shape());
     ORT_ENFORCE(Y != nullptr, "Memcpy: Failed to allocate output tensor.");
-    std::cout << "[Memcpy Kernel] Output tensor shape: " << Y->Shape().ToString() << std::endl;
+    std::cout << "[MEMCPY Kernel] Output tensor shape: " << Y->Shape().ToString() << std::endl;
     memcpy(Y->MutableDataRaw(), X->DataRaw(), X->SizeInBytes());
 
     return Status::OK();
@@ -179,10 +191,12 @@ class NudgevExecutionProvider : public IExecutionProvider {
   DataLayout GetPreferredLayout() const override;
 
  private:
+  mutable std::unordered_map<std::string, SigmoidParams> sigmoid_params_map_;
   mutable std::unordered_map<std::string, ConvQuantParams> quant_params_map_;
   mutable std::unordered_map<std::string, GemmParams> gemm_params_map_;
   mutable std::unordered_map<std::string, MaxPoolParams> maxpool_params_map_;
   mutable std::unordered_map<std::string, AddParams> add_params_map_;
+  std::vector<std::unique_ptr<SigmoidParams>> saved_sigmoid_params_;
   std::vector<std::unique_ptr<ConvQuantParams>> saved_conv_params_;
   std::vector<std::unique_ptr<GemmParams>> saved_gemm_params_;
   std::vector<std::unique_ptr<MaxPoolParams>> saved_maxpool_params_;
