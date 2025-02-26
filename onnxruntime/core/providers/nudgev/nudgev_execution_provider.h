@@ -1,17 +1,30 @@
 #pragma once
-
+#include "core/providers/nudgev/nudgev_device_type.h"
 #include "core/framework/execution_provider.h"
 #include "core/framework/kernel_registry.h"
 #include "core/framework/model_metadef_id_generator.h"
 #include "core/session/onnxruntime_session_options_config_keys.h"
 #include "core/framework/provider_options.h"
 #include "core/framework/data_transfer_manager.h"
+#include "core/providers/nudgev/nudgev_data_transfer.h"
+#include "core/providers/nudgev/nudgev_allocator.h"
 #include <unordered_map>
 #include <immintrin.h>
 #include <vector>
 #include <string>
 
 namespace onnxruntime {
+
+struct alignas(32) DequantizeLinearParams {
+  int64_t batch_size{};
+  int64_t channels{};
+  int64_t height{};
+  int64_t width{};
+  bool dynamic_batch{false};
+  float scale{};
+  int8_t zero_point{};
+  std::vector<int64_t> input_shape;
+};
 
 struct alignas(32) SigmoidParams {
   int64_t batch_size{};
@@ -157,11 +170,26 @@ class Memcpy final : public OpKernel {
   Status Compute(OpKernelContext* ctx) const override {
     const auto* X = ctx->Input<Tensor>(0);
     ORT_ENFORCE(X != nullptr, "Memcpy: Input tensor is nullptr.");
-    std::cout << "[MEMCPY Kernel] Input tensor shape: " << X->Shape().ToString() << std::endl;
+    /*
+        std::cout << "Memcpy: Input tensor details:" << std::endl;
+        std::cout << "  Name: " << X->Location().name << std::endl;
+        std::cout << "  Address: " << X->DataRaw() << std::endl;
+        std::cout << "  Size: " << X->SizeInBytes() << std::endl;
+        std::cout << "  Device Type: " << static_cast<int>(X->Location().device.Type()) << std::endl;
+    */
     Tensor* Y = ctx->Output(0, X->Shape());
     ORT_ENFORCE(Y != nullptr, "Memcpy: Failed to allocate output tensor.");
-    std::cout << "[MEMCPY Kernel] Output tensor shape: " << Y->Shape().ToString() << std::endl;
-    memcpy(Y->MutableDataRaw(), X->DataRaw(), X->SizeInBytes());
+    /*
+        std::cout << "Memcpy: Output tensor details:" << std::endl;
+        std::cout << "  Name: " << Y->Location().name << std::endl;
+        std::cout << "  Address: " << Y->MutableDataRaw() << std::endl;
+        std::cout << "  Size: " << Y->SizeInBytes() << std::endl;
+        std::cout << "  Device Type: " << static_cast<int>(Y->Location().device.Type()) << std::endl;
+    */
+    auto* data_transfer = Info().GetDataTransferManager().GetDataTransfer(
+        X->Location().device, Y->Location().device);
+
+    ORT_RETURN_IF_ERROR(data_transfer->CopyTensorAsync(*X, *Y, *ctx->GetComputeStream()));
 
     return Status::OK();
   }
@@ -169,6 +197,7 @@ class Memcpy final : public OpKernel {
 
 class NudgevExecutionProvider : public IExecutionProvider {
  public:
+  AllocatorPtr CreateCPUAllocator(OrtDevice::DeviceId device_id);
   explicit NudgevExecutionProvider(const ProviderOptions& provider_options_map,
                                    const SessionOptions* session_options = nullptr);
 
@@ -182,13 +211,16 @@ class NudgevExecutionProvider : public IExecutionProvider {
   GetCapability(const GraphViewer& graph_viewer,
                 const IKernelLookup& kernel_lookup) const override;
 
-  Status CreateComputeFunc(NodeComputeInfo& compute_info);
   Status Compile(const std::vector<FusedNodeAndGraph>& fused_nodes_and_graphs,
                  std::vector<NodeComputeInfo>& node_compute_funcs) override;
 
   std::shared_ptr<KernelRegistry> GetKernelRegistry() const override;
 
   DataLayout GetPreferredLayout() const override;
+
+  std::unique_ptr<IDataTransfer> GetDataTransfer() const override;
+  std::vector<AllocatorPtr> CreatePreferredAllocators() override;
+  OrtDevice GetOrtDeviceByMemType(OrtMemType mem_type) const override;
 
  private:
   mutable std::unordered_map<std::string, SigmoidParams> sigmoid_params_map_;
@@ -199,9 +231,10 @@ class NudgevExecutionProvider : public IExecutionProvider {
   std::vector<std::unique_ptr<SigmoidParams>> saved_sigmoid_params_;
   std::vector<std::unique_ptr<ConvQuantParams>> saved_conv_params_;
   std::vector<std::unique_ptr<GemmParams>> saved_gemm_params_;
-  std::vector<std::unique_ptr<MaxPoolParams>> saved_maxpool_params_;
   std::vector<std::unique_ptr<AddParams>> saved_add_params_;
+  std::vector<std::unique_ptr<MaxPoolParams>> saved_maxpool_params_;
   std::unordered_map<std::string, std::string> node_name_mapping_;
+
   Status ParseProviderOptions(const ProviderOptions& provider_options_map);
   std::vector<std::unique_ptr<OpKernel>> kernels_;
   bool disable_cpu_ep_fallback_{false};

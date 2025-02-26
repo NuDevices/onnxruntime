@@ -34,6 +34,7 @@ NudgevProviderFactoryCreator::Create(const ProviderOptions& provider_options_map
 
 }  // namespace onnxruntime
 
+/*
 ORT_API_STATUS_IMPL(OrtSessionOptionsAppendExecutionProvider_Nudgev,
                     _In_ OrtSessionOptions* options,
                     _In_opt_ const char* device_id) {
@@ -46,3 +47,4 @@ ORT_API_STATUS_IMPL(OrtSessionOptionsAppendExecutionProvider_Nudgev,
 
   return nullptr;
 }
+*/
