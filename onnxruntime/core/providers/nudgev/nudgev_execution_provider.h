@@ -1,13 +1,11 @@
 #pragma once
-#include "core/providers/nudgev/nudgev_device_type.h"
+
 #include "core/framework/execution_provider.h"
 #include "core/framework/kernel_registry.h"
 #include "core/framework/model_metadef_id_generator.h"
 #include "core/session/onnxruntime_session_options_config_keys.h"
 #include "core/framework/provider_options.h"
 #include "core/framework/data_transfer_manager.h"
-#include "core/providers/nudgev/nudgev_data_transfer.h"
-#include "core/providers/nudgev/nudgev_allocator.h"
 #include <unordered_map>
 #include <immintrin.h>
 #include <vector>
@@ -165,31 +163,23 @@ struct alignas(32) ConvQuantParams {
 
 class Memcpy final : public OpKernel {
  public:
-  Memcpy(const OpKernelInfo& info) : OpKernel(info) {}
+  explicit Memcpy(const OpKernelInfo& info) : OpKernel(info) {}
 
   Status Compute(OpKernelContext* ctx) const override {
-    const auto* X = ctx->Input<Tensor>(0);
-    ORT_ENFORCE(X != nullptr, "Memcpy: Input tensor is nullptr.");
-    /*
-        std::cout << "Memcpy: Input tensor details:" << std::endl;
-        std::cout << "  Name: " << X->Location().name << std::endl;
-        std::cout << "  Address: " << X->DataRaw() << std::endl;
-        std::cout << "  Size: " << X->SizeInBytes() << std::endl;
-        std::cout << "  Device Type: " << static_cast<int>(X->Location().device.Type()) << std::endl;
-    */
-    Tensor* Y = ctx->Output(0, X->Shape());
-    ORT_ENFORCE(Y != nullptr, "Memcpy: Failed to allocate output tensor.");
-    /*
-        std::cout << "Memcpy: Output tensor details:" << std::endl;
-        std::cout << "  Name: " << Y->Location().name << std::endl;
-        std::cout << "  Address: " << Y->MutableDataRaw() << std::endl;
-        std::cout << "  Size: " << Y->SizeInBytes() << std::endl;
-        std::cout << "  Device Type: " << static_cast<int>(Y->Location().device.Type()) << std::endl;
-    */
-    auto* data_transfer = Info().GetDataTransferManager().GetDataTransfer(
-        X->Location().device, Y->Location().device);
+    // Step 1: Get the input tensor
+    const Tensor* input_tensor = ctx->Input<Tensor>(0);
+    ORT_ENFORCE(input_tensor != nullptr, "Input tensor is null!");
 
-    ORT_RETURN_IF_ERROR(data_transfer->CopyTensorAsync(*X, *Y, *ctx->GetComputeStream()));
+    // Step 2: Use the input tensor directly as output (zero-copy)
+    Tensor* output_tensor = ctx->Output(0, input_tensor->Shape());
+
+    // Ensure output reuses input memory
+    void* input_data = const_cast<void*>(input_tensor->DataRaw());
+    void* output_data = output_tensor->MutableDataRaw();
+
+    if (input_data != output_data) {
+      output_data = input_data; // Point output to input buffer (zero-copy)
+    }
 
     return Status::OK();
   }
@@ -197,7 +187,6 @@ class Memcpy final : public OpKernel {
 
 class NudgevExecutionProvider : public IExecutionProvider {
  public:
-  AllocatorPtr CreateCPUAllocator(OrtDevice::DeviceId device_id);
   explicit NudgevExecutionProvider(const ProviderOptions& provider_options_map,
                                    const SessionOptions* session_options = nullptr);
 
@@ -217,13 +206,6 @@ class NudgevExecutionProvider : public IExecutionProvider {
   std::shared_ptr<KernelRegistry> GetKernelRegistry() const override;
 
   DataLayout GetPreferredLayout() const override;
-
-  std::unique_ptr<IDataTransfer> GetDataTransfer() const override;
-  std::vector<AllocatorPtr> CreatePreferredAllocators() override;
-  OrtDevice GetOrtDeviceByMemType(OrtMemType mem_type) const override;
-
-  std::unordered_map<int, std::unordered_map<int, std::unordered_set<int>>>
-  GetDeviceCopyMap() const override;
 
  private:
   mutable std::unordered_map<std::string, SigmoidParams> sigmoid_params_map_;

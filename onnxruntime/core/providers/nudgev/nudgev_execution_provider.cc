@@ -47,8 +47,10 @@ static void RegisterNudgevKernels(KernelRegistry& kernel_registry) {
             .TypeConstraint("W", DataTypeImpl::GetTensorType<int8_t>())
             .TypeConstraint("B", DataTypeImpl::GetTensorType<int32_t>())
             .TypeConstraint("Y", DataTypeImpl::GetTensorType<int8_t>())
-            .InputMemoryType(OrtMemTypeDefault, 0)
-            .OutputMemoryType(OrtMemTypeDefault, 0),
+            .InputMemoryType(OrtMemTypeCPUOutput, 0)
+            .InputMemoryType(OrtMemTypeCPUOutput, 1)
+            .InputMemoryType(OrtMemTypeCPUOutput, 2)
+            .OutputMemoryType(OrtMemTypeCPUInput, 0),
         create_fn);
 
     ORT_ENFORCE(status.IsOK(), "Failed to register NUDGEV kernel for Conv");
@@ -67,7 +69,7 @@ static void RegisterNudgevKernels(KernelRegistry& kernel_registry) {
             .SetDomain(kOnnxDomain)
             .SinceVersion(1)
             .Provider(kNudgevExecutionProvider)
-            .InputMemoryType(OrtMemTypeCPUInput, 0)
+            .InputMemoryType(OrtMemTypeCPUOutput, 0)
             .TypeConstraint("T", DataTypeImpl::AllFixedSizeTensorTypes()),
         create_fn);
 
@@ -88,7 +90,7 @@ static void RegisterNudgevKernels(KernelRegistry& kernel_registry) {
             .SetDomain(kOnnxDomain)
             .SinceVersion(1)
             .Provider(kNudgevExecutionProvider)
-            .OutputMemoryType(OrtMemTypeCPUOutput, 0)
+            .OutputMemoryType(OrtMemTypeCPUInput, 0)
             .TypeConstraint("T", DataTypeImpl::AllFixedSizeTensorTypes()),
         create_fn);
     ORT_ENFORCE(status.IsOK(), "Failed to register NUDGEV kernel for MemcpyToHost");
@@ -123,51 +125,6 @@ Status NudgevExecutionProvider::ParseProviderOptions(const ProviderOptions& prov
   return Status::OK();
 }
 
-std::unique_ptr<IDataTransfer> NudgevExecutionProvider::GetDataTransfer() const {
-  return std::make_unique<NudgevDataTransfer>();
-}
-
-OrtDevice NudgevExecutionProvider::GetOrtDeviceByMemType(OrtMemType mem_type) const {
-  // For CPU input operations, use regular CPU device
-  if (mem_type == OrtMemTypeCPUInput) {
-    return OrtDevice(OrtDevice::CPU, OrtDevice::MemType::DEFAULT, device_id_);
-  }
-
-  // For CPU output operations, use regular CPU device
-  if (mem_type == OrtMemTypeCPUOutput) {
-    return OrtDevice(OrtDevice::CPU, OrtDevice::MemType::DEFAULT, device_id_);
-  }
-
-  // For default operations, use the NudgeV device
-  return OrtDevice(kNudgevDeviceType, OrtDevice::MemType::DEFAULT, device_id_);
-}
-
-std::vector<AllocatorPtr> NudgevExecutionProvider::CreatePreferredAllocators() {
-  std::vector<AllocatorPtr> allocators;
-
-  auto device_allocator = std::make_unique<NudgevAllocator>(device_id_, NUDGEV);
-  allocators.push_back(std::move(device_allocator));
-
-  return allocators;
-}
-
-// cpu allocator
-/*
-std::vector<AllocatorPtr> NudgevExecutionProvider::CreatePreferredAllocators() {
-  std::vector<AllocatorPtr> allocators;
-
-  allocators.push_back(CreateCPUAllocator(device_id_));
-
-  return allocators;
-}
-
-AllocatorPtr NudgevExecutionProvider::CreateCPUAllocator(OrtDevice::DeviceId device_id) {
-  return std::make_unique<CPUAllocator>(
-      OrtMemoryInfo("CPU", OrtAllocatorType::OrtDeviceAllocator,
-                    OrtDevice(OrtDevice::CPU, OrtDevice::MemType::DEFAULT, device_id),
-                    device_id, OrtMemTypeDefault));
-}
-*/
 NudgevExecutionProvider::NudgevExecutionProvider(
     const ProviderOptions& provider_options_map,
     const SessionOptions* session_options)
@@ -519,18 +476,5 @@ Status NudgevExecutionProvider::Compile(
   }
 
   return Status::OK();
-}
-
-std::unordered_map<int, std::unordered_map<int, std::unordered_set<int>>>
-NudgevExecutionProvider::GetDeviceCopyMap() const {
-  // This tells ONNX Runtime that the CPU and NudgeV devices can directly access
-  // each other's memory, enabling zero-copy transfers
-
-  // Map structure: {src_device_type, {dst_device_type, {memory_types}}}
-  // The memory_types set {0} means "default memory type only"
-  return {
-    {OrtDevice::CPU, {{kNudgevDeviceType, {0}}}},  // CPU can access NudgeV memory
-    {kNudgevDeviceType, {{OrtDevice::CPU, {0}}}}   // NudgeV can access CPU memory
-  };
 }
 }  // namespace onnxruntime
