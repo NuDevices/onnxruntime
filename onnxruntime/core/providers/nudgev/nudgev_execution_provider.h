@@ -222,6 +222,9 @@ class NudgevExecutionProvider : public IExecutionProvider {
   std::vector<AllocatorPtr> CreatePreferredAllocators() override;
   OrtDevice GetOrtDeviceByMemType(OrtMemType mem_type) const override;
 
+  std::unordered_map<int, std::unordered_map<int, std::unordered_set<int>>>
+  GetDeviceCopyMap() const override;
+
  private:
   mutable std::unordered_map<std::string, SigmoidParams> sigmoid_params_map_;
   mutable std::unordered_map<std::string, ConvQuantParams> quant_params_map_;

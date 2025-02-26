@@ -128,29 +128,25 @@ std::unique_ptr<IDataTransfer> NudgevExecutionProvider::GetDataTransfer() const 
 }
 
 OrtDevice NudgevExecutionProvider::GetOrtDeviceByMemType(OrtMemType mem_type) const {
-  if (mem_type == OrtMemTypeCPUInput) return OrtDevice();
-  if (mem_type == OrtMemTypeCPUOutput) return OrtDevice(kNudgevDeviceType, NUDGEV_PINNED_MEMORY_TYPE, 0);
-  return default_device_;
+  // For CPU input operations, use regular CPU device
+  if (mem_type == OrtMemTypeCPUInput) {
+    return OrtDevice(OrtDevice::CPU, OrtDevice::MemType::DEFAULT, device_id_);
+  }
+
+  // For CPU output operations, use regular CPU device
+  if (mem_type == OrtMemTypeCPUOutput) {
+    return OrtDevice(OrtDevice::CPU, OrtDevice::MemType::DEFAULT, device_id_);
+  }
+
+  // For default operations, use the NudgeV device
+  return OrtDevice(kNudgevDeviceType, OrtDevice::MemType::DEFAULT, device_id_);
 }
-/* old getort
-OrtDevice NudgevExecutionProvider::GetOrtDeviceByMemType(OrtMemType mem_type) const {
-  if (mem_type == OrtMemTypeCPUInput)
-    return OrtDevice(OrtDevice::CPU, 0, 0);  // Default memory type (0)
-  if (mem_type == OrtMemTypeCPUOutput)
-    return OrtDevice(OrtDevice::CPU, NUDGEV_PINNED_MEMORY_TYPE, device_id_);
-  return OrtDevice(kNudgevDeviceType, 0, device_id_);  // Default memory type (0)
-}
-*/
-// nudgev allocator
 
 std::vector<AllocatorPtr> NudgevExecutionProvider::CreatePreferredAllocators() {
   std::vector<AllocatorPtr> allocators;
 
   auto device_allocator = std::make_unique<NudgevAllocator>(device_id_, NUDGEV);
   allocators.push_back(std::move(device_allocator));
-
-  auto cpu_allocator = std::make_unique<NudgevPinnedAllocator>(device_id_, NUDGEV_PINNED);
-  allocators.push_back(std::move(cpu_allocator));
 
   return allocators;
 }
@@ -523,5 +519,18 @@ Status NudgevExecutionProvider::Compile(
   }
 
   return Status::OK();
+}
+
+std::unordered_map<int, std::unordered_map<int, std::unordered_set<int>>>
+NudgevExecutionProvider::GetDeviceCopyMap() const {
+  // This tells ONNX Runtime that the CPU and NudgeV devices can directly access
+  // each other's memory, enabling zero-copy transfers
+
+  // Map structure: {src_device_type, {dst_device_type, {memory_types}}}
+  // The memory_types set {0} means "default memory type only"
+  return {
+    {OrtDevice::CPU, {{kNudgevDeviceType, {0}}}},  // CPU can access NudgeV memory
+    {kNudgevDeviceType, {{OrtDevice::CPU, {0}}}}   // NudgeV can access CPU memory
+  };
 }
 }  // namespace onnxruntime
