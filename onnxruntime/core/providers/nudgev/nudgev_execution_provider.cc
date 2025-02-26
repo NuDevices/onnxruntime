@@ -47,6 +47,7 @@ static void RegisterNudgevKernels(KernelRegistry& kernel_registry) {
             .TypeConstraint("W", DataTypeImpl::GetTensorType<int8_t>())
             .TypeConstraint("B", DataTypeImpl::GetTensorType<int32_t>())
             .TypeConstraint("Y", DataTypeImpl::GetTensorType<int8_t>())
+            .MayInplace(0, 0)
             .InputMemoryType(OrtMemTypeCPUOutput, 0)
             .InputMemoryType(OrtMemTypeCPUOutput, 1)
             .InputMemoryType(OrtMemTypeCPUOutput, 2)
@@ -70,6 +71,7 @@ static void RegisterNudgevKernels(KernelRegistry& kernel_registry) {
             .SinceVersion(1)
             .Provider(kNudgevExecutionProvider)
             .InputMemoryType(OrtMemTypeCPUOutput, 0)
+            .MayInplace(0, 0)
             .TypeConstraint("T", DataTypeImpl::AllFixedSizeTensorTypes()),
         create_fn);
 
@@ -91,6 +93,7 @@ static void RegisterNudgevKernels(KernelRegistry& kernel_registry) {
             .SinceVersion(1)
             .Provider(kNudgevExecutionProvider)
             .OutputMemoryType(OrtMemTypeCPUInput, 0)
+            .MayInplace(0, 0)
             .TypeConstraint("T", DataTypeImpl::AllFixedSizeTensorTypes()),
         create_fn);
     ORT_ENFORCE(status.IsOK(), "Failed to register NUDGEV kernel for MemcpyToHost");

@@ -178,7 +178,8 @@ class Memcpy final : public OpKernel {
     void* output_data = output_tensor->MutableDataRaw();
 
     if (input_data != output_data) {
-      output_data = input_data; // Point output to input buffer (zero-copy)
+      std::cout << "memcopy" << std::endl;
+      memcpy(output_data, input_data, input_tensor->SizeInBytes());
     }
 
     return Status::OK();
