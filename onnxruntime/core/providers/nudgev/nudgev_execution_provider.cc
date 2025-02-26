@@ -128,9 +128,19 @@ std::unique_ptr<IDataTransfer> NudgevExecutionProvider::GetDataTransfer() const 
 }
 
 OrtDevice NudgevExecutionProvider::GetOrtDeviceByMemType(OrtMemType mem_type) const {
-  return OrtDevice(kNudgevDeviceType, OrtDevice::MemType::DEFAULT, device_id_);
+  if (mem_type == OrtMemTypeCPUInput) return OrtDevice();
+  if (mem_type == OrtMemTypeCPUOutput) return OrtDevice(kNudgevDeviceType, NUDGEV_PINNED_MEMORY_TYPE, 0);
+  return default_device_;
 }
-
+/* old getort
+OrtDevice NudgevExecutionProvider::GetOrtDeviceByMemType(OrtMemType mem_type) const {
+  if (mem_type == OrtMemTypeCPUInput)
+    return OrtDevice(OrtDevice::CPU, 0, 0);  // Default memory type (0)
+  if (mem_type == OrtMemTypeCPUOutput)
+    return OrtDevice(OrtDevice::CPU, NUDGEV_PINNED_MEMORY_TYPE, device_id_);
+  return OrtDevice(kNudgevDeviceType, 0, device_id_);  // Default memory type (0)
+}
+*/
 // nudgev allocator
 
 std::vector<AllocatorPtr> NudgevExecutionProvider::CreatePreferredAllocators() {
@@ -480,8 +490,6 @@ Status NudgevExecutionProvider::Compile(
   for (const auto& fused_node_and_graph : fused_nodes_and_graphs) {
     const Node& fused_node = fused_node_and_graph.fused_node;
     NodeComputeInfo compute_info;
-    std::cout << "Fused nodes: " << fused_node.Name() << std::endl;
-    std::cout << "Fused op type: " << fused_node.OpType() << std::endl;
 
     if (quant_params_map_.find(fused_node.Name()) != quant_params_map_.end()) {
       auto it = quant_params_map_.find(fused_node.Name());

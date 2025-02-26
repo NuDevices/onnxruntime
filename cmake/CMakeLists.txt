@@ -139,7 +139,7 @@ option(onnxruntime_ARMNN_BN_USE_CPU "Use the CPU implementation for the Batch No
 option(onnxruntime_ENABLE_INSTRUMENT "Enable Instrument with Event Tracing for Windows (ETW)" OFF)
 option(onnxruntime_USE_TELEMETRY "Build with Telemetry" OFF)
 cmake_dependent_option(onnxruntime_USE_MIMALLOC "Override new/delete and arena allocator with mimalloc" OFF "WIN32;NOT onnxruntime_USE_CUDA;NOT onnxruntime_USE_OPENVINO" OFF)
-option(onnxruntime_USE_CANN "Build with CANN support" OFF)
+option(onnxruntime_USE_CANN "Build with CANN support" ON)
 option(onnxruntime_USE_ROCM "Build with AMD GPU support" OFF)
 option(onnxruntime_USE_TVM "Build with TVM support" OFF)
 option(onnxruntime_TVM_CUDA_RUNTIME "Build TVM with CUDA support" OFF)
