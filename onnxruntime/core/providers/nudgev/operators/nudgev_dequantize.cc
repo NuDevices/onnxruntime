@@ -18,42 +18,56 @@ void nudgev_dequantize_linear(
     float scale,
     int8_t zero_point,
     onnxruntime::concurrency::ThreadPool* tp) {
-  const int vector_size = 8;
+  constexpr int vector_size = 16;  // Process 16 elements per main loop iteration
+  const float scaled_zero_point = -zero_point * scale;
+  const __m256 scale_vec = _mm256_set1_ps(scale);
+  const __m256 scaled_zp_vec = _mm256_set1_ps(scaled_zero_point);
 
   auto process_chunk = [&](int64_t start_idx, int64_t end_idx) {
-    __m256 scale_vec = _mm256_set1_ps(scale);
-    __m256i zero_point_vec = _mm256_set1_epi32(static_cast<int32_t>(zero_point));
-
     int64_t i = start_idx;
 
+    // Process 16 elements per iteration
     for (; i + vector_size <= end_idx; i += vector_size) {
-      __m128i input_i8 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(input + i));
+      // Load 16 int8 elements
+      const __m128i input16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(input + i));
 
-      __m256i input_i32 = _mm256_cvtepi8_epi32(input_i8);
+      // Process first 8 elements
+      __m256i input_i32 = _mm256_cvtepi8_epi32(input16);
+      __m256 input_f = _mm256_cvtepi32_ps(input_i32);
+      __m256 result = _mm256_fmadd_ps(input_f, scale_vec, scaled_zp_vec);
+      _mm256_storeu_ps(output + i, result);
 
-      __m256i centered = _mm256_sub_epi32(input_i32, zero_point_vec);
-
-      __m256 centered_f = _mm256_cvtepi32_ps(centered);
-
-      __m256 output_f = _mm256_mul_ps(centered_f, scale_vec);
-
-      _mm256_storeu_ps(output + i, output_f);
+      // Process next 8 elements
+      const __m128i high64 = _mm_srli_si128(input16, 8);
+      input_i32 = _mm256_cvtepi8_epi32(high64);
+      input_f = _mm256_cvtepi32_ps(input_i32);
+      result = _mm256_fmadd_ps(input_f, scale_vec, scaled_zp_vec);
+      _mm256_storeu_ps(output + i + 8, result);
     }
 
+    // Process remaining elements in groups of 8
+    for (; i + 8 <= end_idx; i += 8) {
+      const __m128i input8 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(input + i));
+      const __m256i input_i32 = _mm256_cvtepi8_epi32(input8);
+      const __m256 input_f = _mm256_cvtepi32_ps(input_i32);
+      const __m256 result = _mm256_fmadd_ps(input_f, scale_vec, scaled_zp_vec);
+      _mm256_storeu_ps(output + i, result);
+    }
+
+    // Handle remaining elements
     for (; i < end_idx; ++i) {
-      output[i] = static_cast<float>(static_cast<int32_t>(input[i]) - static_cast<int32_t>(zero_point)) * scale;
+      output[i] = input[i] * scale + scaled_zero_point;
     }
   };
 
+  constexpr int64_t chunk_size = 1024;  // Multiple of 16 for alignment
   if (tp != nullptr) {
-    const int64_t chunk_size = 1024;
     const int64_t num_chunks = (total_elements + chunk_size - 1) / chunk_size;
-
     onnxruntime::concurrency::ThreadPool::TrySimpleParallelFor(
         tp, num_chunks,
         [&](int64_t chunk_idx) {
-          int64_t start = chunk_idx * chunk_size;
-          int64_t end = std::min(start + chunk_size, total_elements);
+          const int64_t start = chunk_idx * chunk_size;
+          const int64_t end = std::min(start + chunk_size, total_elements);
           process_chunk(start, end);
         });
   } else {
@@ -68,36 +82,35 @@ void nudgev_dequantize_linear_int32(
     float scale,
     int32_t zero_point,
     onnxruntime::concurrency::ThreadPool* tp) {
-  const int vector_size = 8;
+  constexpr int vector_size = 8;
+  const float scaled_zero_point = -zero_point * scale;
+  const __m256 scale_vec = _mm256_set1_ps(scale);
+  const __m256 scaled_zp_vec = _mm256_set1_ps(scaled_zero_point);
 
   auto process_chunk = [&](int64_t start_idx, int64_t end_idx) {
-    __m256 scale_vec = _mm256_set1_ps(scale);
-    __m256i zero_point_vec = _mm256_set1_epi32(zero_point);
-
     int64_t i = start_idx;
 
     for (; i + vector_size <= end_idx; i += vector_size) {
-      __m256i input_i32 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(input + i));
-      __m256i centered = _mm256_sub_epi32(input_i32, zero_point_vec);
-      __m256 centered_f = _mm256_cvtepi32_ps(centered);
-      __m256 output_f = _mm256_mul_ps(centered_f, scale_vec);
-      _mm256_storeu_ps(output + i, output_f);
+      const __m256i input_i32 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(input + i));
+      const __m256 input_f = _mm256_cvtepi32_ps(input_i32);
+      const __m256 result = _mm256_fmadd_ps(input_f, scale_vec, scaled_zp_vec);
+      _mm256_storeu_ps(output + i, result);
     }
 
+    // Process remaining elements
     for (; i < end_idx; ++i) {
-      output[i] = static_cast<float>(input[i] - zero_point) * scale;
+      output[i] = input[i] * scale + scaled_zero_point;
     }
   };
 
+  constexpr int64_t chunk_size = 1024;  // Multiple of 8 for alignment
   if (tp != nullptr) {
-    const int64_t chunk_size = 1024;
     const int64_t num_chunks = (total_elements + chunk_size - 1) / chunk_size;
-
     onnxruntime::concurrency::ThreadPool::TrySimpleParallelFor(
         tp, num_chunks,
         [&](int64_t chunk_idx) {
-          int64_t start = chunk_idx * chunk_size;
-          int64_t end = std::min(start + chunk_size, total_elements);
+          const int64_t start = chunk_idx * chunk_size;
+          const int64_t end = std::min(start + chunk_size, total_elements);
           process_chunk(start, end);
         });
   } else {

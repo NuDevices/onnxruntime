@@ -33,7 +33,7 @@ struct alignas(32) GemmParams {
   int64_t N{};
   int64_t K{};
   int64_t batch_size{};
-  bool dynamic_batch{false};
+  bool dynamic_batch{};
   double input_scale{};
   int8_t input_zp{};
   double weight_scale{};
@@ -43,7 +43,6 @@ struct alignas(32) GemmParams {
   int32_t M_fixed{};
   alignas(32) std::vector<int8_t> weights_buffer;
   alignas(32) std::vector<int32_t> bias_buffer;
-  alignas(32) std::vector<int8_t> input_centered_buffer;
 };
 
 struct alignas(32) ConvQuantParams {
@@ -78,9 +77,8 @@ struct alignas(32) ConvQuantParams {
 
   alignas(32) std::vector<int8_t> weights;
   alignas(32) std::vector<int32_t> bias;
-  alignas(32) std::vector<int8_t> im2row_buffer;
+  alignas(32) std::vector<int8_t> im2col_buffer;
   alignas(32) std::vector<int8_t> temp_buffer;
-  alignas(32) std::vector<int8_t> input_centered_buffer;
   alignas(32) std::vector<int8_t> padded_buffer;
 
   Status initialize_buffers(const std::vector<int64_t>& weight_shape_,
@@ -101,7 +99,7 @@ struct alignas(32) ConvQuantParams {
     const size_t N = batch_size * output_height * output_width;
 
     weights.resize(K * OC);
-    im2row_buffer.resize(N * K);
+    im2col_buffer.resize(N * K);
 
     if (!bias_shape.empty()) {
       bias.resize(bias_shape[0]);
@@ -116,14 +114,9 @@ class Memcpy final : public OpKernel {
   explicit Memcpy(const OpKernelInfo& info) : OpKernel(info) {}
 
   Status Compute(OpKernelContext* ctx) const override {
-    // Step 1: Get the input tensor
     const Tensor* input_tensor = ctx->Input<Tensor>(0);
     ORT_ENFORCE(input_tensor != nullptr, "Input tensor is null!");
-
-    // Step 2: Use the input tensor directly as output (zero-copy)
     Tensor* output_tensor = ctx->Output(0, input_tensor->Shape());
-
-    // Ensure output reuses input memory
     void* input_data = const_cast<void*>(input_tensor->DataRaw());
     void* output_data = output_tensor->MutableDataRaw();
 

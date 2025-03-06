@@ -1,5 +1,6 @@
 #include "core/providers/nudgev/nudgev_execution_provider.h"
 #include "core/providers/nudgev/operators/nudgev_conv.h"
+#include "core/providers/nudgev/operators/supported_ops.h"
 #include "core/providers/nudgev/operators/nudgev_gemm.h"
 #include "core/providers/nudgev/operators/nudgev_dequantize.h"
 #include "core/framework/compute_capability.h"
@@ -39,8 +40,7 @@ static void RegisterNudgevKernels(KernelRegistry& kernel_registry) {
             .SetDomain(kOnnxDomain)
             .SinceVersion(10)
             .Provider(kNudgevExecutionProvider)
-            .TypeConstraint("x", {DataTypeImpl::GetTensorType<int8_t>(),
-                                  DataTypeImpl::GetTensorType<int32_t>()})
+            .TypeConstraint("x", {DataTypeImpl::GetTensorType<int8_t>()})
             .TypeConstraint("x_scale", DataTypeImpl::GetTensorType<float>())
             .TypeConstraint("x_zero_point", DataTypeImpl::GetTensorType<int8_t>())
             .TypeConstraint("y", DataTypeImpl::GetTensorType<float>())
@@ -312,7 +312,7 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
 
       int64_t effective_batch_size = initial_batch_size;
       if (initial_batch_size == 0) {
-        effective_batch_size = 16;
+        effective_batch_size = 8;
         params.dynamic_batch = true;
       }
 
@@ -324,7 +324,6 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
       const size_t input_size = effective_batch_size * input_channels * input_height * input_width;
       const size_t padded_input = effective_batch_size * input_channels * max_padded_height * max_padded_width;
       params.padded_buffer.resize(padded_input);
-      params.input_centered_buffer.resize(input_size);
       params.temp_buffer.resize(temp_buffer_size);
 
       const auto& input_qparams = input_dq->InputDefs();
@@ -540,7 +539,7 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
       // For A matrix
       const int64_t initial_batch_size = shape_proto_a->dim(0).dim_value();
       params.dynamic_batch = initial_batch_size == 0;
-      params.batch_size = params.dynamic_batch ? 16 : initial_batch_size;
+      params.batch_size = params.dynamic_batch ? 8 : initial_batch_size;
 
       // Calculate M, N, K dimensions based on input shapes and transpose flags
       if (!params.transA) {
@@ -674,9 +673,6 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
       float M = params.input_scale * params.weight_scale / params.output_scale;
       params.M_fixed = static_cast<int32_t>(M * (1 << 15));
 
-      // Prepare input centered buffer if needed
-      params.input_centered_buffer.resize(params.M * params.K);
-
       // Create a unique node name for this GEMM node
       uint64_t model_hash;
       int metadef_id = this->metadef_id_generator_.GenerateId(graph_viewer, model_hash);
@@ -710,7 +706,28 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
       continue;
     }
 
-    if (node->OpType() == "DequantizeLinear1") {
+    if (nudgev::ShouldSkipBeforeQuantized(node->OpType())) {
+      bool skip_node = false;
+      const std::string& output_name = node->OutputDefs()[0]->Name();
+      auto consumer_nodes = graph_viewer.GetConsumerNodes(output_name);
+
+      for (const auto* consumer : consumer_nodes) {
+        if (nudgev::IsQuantizedOperatorSupported(consumer->OpType()) &&
+            handled_nodes.find(consumer) == handled_nodes.end()) {
+          LOGS_DEFAULT(INFO) << "Skipping " << node->OpType() << " node " << node->Name()
+                             << " since it feeds into quantized operator " << consumer->Name();
+          skip_node = true;
+          break;
+        }
+      }
+
+      if (skip_node) {
+        handled_nodes.insert(node);
+        continue;
+      }
+    }
+
+    if (node->OpType() == "DequantizeLinear") {
       DequantizeLinearParams params{};
 
       const auto* input_shape = node->InputDefs()[0]->Shape();
@@ -752,7 +769,7 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
       }
 
       if (params.batch_size == 0) {
-        params.batch_size = 1;
+        params.batch_size = 8;
         params.dynamic_batch = true;
       }
 
