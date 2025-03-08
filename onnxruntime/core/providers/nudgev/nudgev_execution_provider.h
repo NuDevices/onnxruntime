@@ -67,6 +67,11 @@ struct alignas(32) ConvQuantParams {
   int64_t output_width{};
   int64_t batch_size{};
 
+  size_t weights_ddr3_address = 0;  // Indirizzo dei pesi nella DDR3
+  size_t bias_ddr3_address = 0;     // Indirizzo dei bias nella DDR3
+  int64_t k_blocks = 0;             // Numero di blocchi K
+  int64_t oc_blocks = 0;            // Numero di blocchi OC
+
   std::vector<int64_t> strides;
   std::vector<int64_t> pads;
   std::vector<int64_t> dilations;

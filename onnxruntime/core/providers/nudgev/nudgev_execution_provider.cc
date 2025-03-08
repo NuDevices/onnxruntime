@@ -1,5 +1,6 @@
 #include "core/providers/nudgev/nudgev_execution_provider.h"
 #include "core/providers/nudgev/operators/nudgev_conv.h"
+#include "core/providers/nudgev/operators/nudgev_conv_accelerated.h"
 #include "core/providers/nudgev/operators/supported_ops.h"
 #include "core/providers/nudgev/operators/nudgev_gemm.h"
 #include "core/providers/nudgev/operators/nudgev_dequantize.h"
@@ -21,6 +22,8 @@
 #include "core/platform/threadpool.h"
 #include "core/platform/ort_mutex.h"
 #include <algorithm>
+
+#include "core/providers/nudgev/mock/mock_accelerator_memory.h"
 
 namespace onnxruntime {
 
@@ -461,6 +464,99 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
       std::fill(params.padded_buffer.begin(), params.padded_buffer.end(), params.input_zp);
       params.node_name = node->Name();
 
+      const int64_t K = IC * KH * KW;
+      const int64_t block_size = 32;
+
+      int64_t k_blocks = (K + block_size - 1) / block_size;
+      int64_t oc_blocks = (OC + block_size - 1) / block_size;
+
+      // Initialize memory manager
+      auto& mem_manager = nudgev::mock::AcceleratorMemoryManager::getInstance();
+      static bool memory_initialized = false;
+      if (!memory_initialized) {
+        constexpr size_t MEMORY_SIZE = 2ULL * 1024 * 1024 * 1024;
+        constexpr size_t BIAS_OFFSET = 100ULL * 1024 * 1024;
+        mem_manager.initialize(MEMORY_SIZE, BIAS_OFFSET);
+        memory_initialized = true;
+      }
+
+      size_t weights_size = k_blocks * oc_blocks * block_size * block_size;
+      size_t weights_address = mem_manager.allocate_weights_memory(weights_size);
+
+      std::vector<int8_t> fully_transposed(K * OC, 0);
+      for (int64_t oc = 0; oc < OC; oc++) {
+        for (int64_t k = 0; k < K; k++) {
+          int64_t orig_idx = oc * K + k;
+          int64_t trans_idx = k * OC + oc;
+          fully_transposed[trans_idx] = params.weights[orig_idx];
+        }
+      }
+      std::vector<int8_t> blocked_weights(weights_size, 0);
+
+      for (int64_t kb = 0; kb < k_blocks; kb++) {
+        for (int64_t ocb = 0; ocb < oc_blocks; ocb++) {
+          int64_t block_idx = kb * oc_blocks + ocb;
+          size_t block_offset = block_idx * block_size * block_size;
+          int64_t actual_k_size = std::min(block_size, K - kb * block_size);
+          int64_t actual_oc_size = std::min(block_size, OC - ocb * block_size);
+          for (int64_t k_offset = 0; k_offset < actual_k_size; k_offset++) {
+            for (int64_t oc_offset = 0; oc_offset < actual_oc_size; oc_offset++) {
+              int64_t k_idx = kb * block_size + k_offset;
+              int64_t oc_idx = ocb * block_size + oc_offset;
+              int64_t trans_idx = k_idx * OC + oc_idx;
+              size_t dest_idx = block_offset + k_offset * block_size + oc_offset;
+              blocked_weights[dest_idx] = fully_transposed[trans_idx];
+            }
+          }
+        }
+      }
+      bool weights_written = mem_manager.write_to_memory(
+          weights_address,
+          blocked_weights.data(),
+          blocked_weights.size());
+
+      if (!weights_written) {
+        std::cerr << "Error: failed to write weights to accelerator memory" << std::endl;
+        return result;
+      }
+      size_t bias_address = 0;
+      if (params.has_bias) {
+        size_t bias_size = oc_blocks * block_size * sizeof(int32_t);
+        bias_address = mem_manager.allocate_bias_memory(bias_size);
+        std::vector<int32_t> bias_blocks(oc_blocks * block_size, 0);
+
+        for (int64_t ocb = 0; ocb < oc_blocks; ocb++) {
+          for (int64_t oc_offset = 0; oc_offset < block_size; oc_offset++) {
+            int64_t oc_idx = ocb * block_size + oc_offset;
+
+            if (oc_idx < OC) {
+              bias_blocks[ocb * block_size + oc_offset] = params.bias[oc_idx];
+            }
+          }
+        }
+        bool bias_written = mem_manager.write_to_memory(
+            bias_address,
+            bias_blocks.data(),
+            bias_blocks.size() * sizeof(int32_t));
+
+        if (!bias_written) {
+          std::cerr << "Error: failed to write bias to accelerator memory" << std::endl;
+          return result;
+        }
+      }
+      params.weights_ddr3_address = weights_address;
+      params.bias_ddr3_address = bias_address;
+      params.k_blocks = k_blocks;
+      params.oc_blocks = oc_blocks;
+
+      /*
+      std::cout << "GetCapability - Node: " << node->Name()
+      << " weights_ddr3_address: 0x" << std::hex << params.weights_ddr3_address
+      << ", bias_ddr3_address: 0x" << params.bias_ddr3_address << std::dec
+      << ", k_blocks: " << params.k_blocks
+      << ", oc_blocks: " << params.oc_blocks << std::endl;
+      */
+
       std::vector<const Node*> fused_nodes{input_dq, weight_dq, node};
       if (bias_dq) {
         fused_nodes.push_back(bias_dq);
@@ -805,9 +901,18 @@ Status NudgevExecutionProvider::Compile(
       if (it == quant_params_map_.end()) {
         return Status(common::ONNXRUNTIME, common::FAIL, "Conv parameters not found");
       }
-      auto kernel_params = std::make_unique<ConvQuantParams>(std::move(it->second));
+      /*
+      std::cout << "Compile - Before copy - Node: " << fused_node.Name()
+          << " weights_ddr3_address: 0x" << std::hex << it->second.weights_ddr3_address
+          << ", bias_ddr3_address: 0x" << it->second.bias_ddr3_address << std::dec << std::endl;
+      */
+      auto kernel_params = std::make_unique<ConvQuantParams>(it->second);
       auto params_copy = kernel_params.get();
-
+      /*
+      std::cout << "Compile - After copy - Node: " << fused_node.Name()
+          << " weights_ddr3_address: 0x" << std::hex << params_copy->weights_ddr3_address
+          << ", bias_ddr3_address: 0x" << params_copy->bias_ddr3_address << std::dec << std::endl;
+      */
       compute_info.create_state_func = [params_copy](ComputeContext*, FunctionState* state) {
         *state = params_copy;
         return 0;
@@ -818,7 +923,8 @@ Status NudgevExecutionProvider::Compile(
       compute_info.compute_func = [](FunctionState state,
                                      const OrtApi*,
                                      OrtKernelContext* context) -> Status {
-        return onnxruntime::nudgev::ComputeNudgeVConv(static_cast<ConvQuantParams*>(state), context);
+        return onnxruntime::nudgev::ComputeNudgeVConvWithAccelerator(
+            static_cast<ConvQuantParams*>(state), context);
       };
 
       saved_conv_params_.push_back(std::move(kernel_params));
@@ -876,4 +982,5 @@ Status NudgevExecutionProvider::Compile(
 
   return Status::OK();
 }
+
 }  // namespace onnxruntime

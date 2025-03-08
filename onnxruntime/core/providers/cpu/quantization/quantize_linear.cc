@@ -10,6 +10,7 @@
 #include "core/providers/common.h"
 #include "core/mlas/inc/mlas.h"
 #include "core/util/qmath.h"
+#include <chrono>
 
 namespace onnxruntime {
 
@@ -270,6 +271,9 @@ struct DequantizeLinearApply;
 // If the quantization happens on the first or last axis, the flattened tensor is
 // effectively rank-2.
 // For per tensor quantization, the tensor is effectively rank-1.
+template <typename T, typename OutT, bool is_4bit>
+struct DequantizeLinearApply;
+
 template <typename T, typename OutT>
 struct DequantizeLinearApply<T, OutT, false> {
   /**
@@ -286,6 +290,44 @@ struct DequantizeLinearApply<T, OutT, false> {
    */
   void op(size_t M, size_t K, size_t N, const T* input,
           const OutT* scale, OutT* output, const T* zero_point) {
+    // Caso speciale per int8_t -> float e per-tensor quantization
+    if constexpr (std::is_same_v<T, int8_t> && std::is_same_v<OutT, float>) {
+      if (K == 1 && M == 1) {  // Per-tensor quantization
+        auto zp = zero_point ? static_cast<int32_t>(zero_point[0]) : 0;
+        auto sc = static_cast<float>(scale[0]);
+
+        // Precompute -zp*scale una volta sola
+        const float scaled_zp = -static_cast<float>(zp) * sc;
+
+        // Size totale
+        size_t total_size = M * K * N;
+
+        // Loop unrolling per migliorare le prestazioni
+        size_t i = 0;
+        constexpr size_t step = 8;
+
+        // Processa 8 elementi alla volta
+        for (; i + step <= total_size; i += step) {
+          output[i] = static_cast<float>(static_cast<int32_t>(input[i])) * sc + scaled_zp;
+          output[i + 1] = static_cast<float>(static_cast<int32_t>(input[i + 1])) * sc + scaled_zp;
+          output[i + 2] = static_cast<float>(static_cast<int32_t>(input[i + 2])) * sc + scaled_zp;
+          output[i + 3] = static_cast<float>(static_cast<int32_t>(input[i + 3])) * sc + scaled_zp;
+          output[i + 4] = static_cast<float>(static_cast<int32_t>(input[i + 4])) * sc + scaled_zp;
+          output[i + 5] = static_cast<float>(static_cast<int32_t>(input[i + 5])) * sc + scaled_zp;
+          output[i + 6] = static_cast<float>(static_cast<int32_t>(input[i + 6])) * sc + scaled_zp;
+          output[i + 7] = static_cast<float>(static_cast<int32_t>(input[i + 7])) * sc + scaled_zp;
+        }
+
+        // Elementi rimanenti
+        for (; i < total_size; ++i) {
+          output[i] = static_cast<float>(static_cast<int32_t>(input[i])) * sc + scaled_zp;
+        }
+
+        return;
+      }
+    }
+
+    // Implementation originale per tutti gli altri casi
     for (size_t m = 0; m < M; m++) {
       for (size_t k = 0; k < K; k++) {
         auto zp = zero_point ? static_cast<int32_t>(zero_point[k]) : 0;
@@ -354,7 +396,6 @@ struct DequantizeLinearApply<T, OutT, true> {
   void op(size_t M, size_t K, size_t N,
           const T* input, const OutT* scale, OutT* output, const T* zero_point) {
     size_t input_index = 0;
-
     for (size_t m = 0; m < M; m++) {
       for (size_t bd = 0; bd < K; bd++) {
         size_t bd_i = bd >> 1;  /*bd / 2*/
@@ -466,6 +507,9 @@ DEQUANTIZE_LINEAR_APPLY_FLOAT8(Float8E5M2FNUZ)
 // formula is Y = (X - ZeroPoint) * Scale
 template <typename T>
 Status DequantizeLinear<T>::Compute(OpKernelContext* ctx) const {
+  // Inizia il timer
+  auto start = std::chrono::high_resolution_clock::now();
+
   auto& x = *ctx->Input<Tensor>(0);
   auto& x_scale = *ctx->Input<Tensor>(1);
   auto* x_zero_point = ctx->Input<Tensor>(2);
@@ -502,18 +546,21 @@ Status DequantizeLinear<T>::Compute(OpKernelContext* ctx) const {
     const float* scale = x_scale.Data<float>();
     float* output = y.MutableData<float>();
     if (block_size_) {
+      std::cout << "a" << std::endl;
       DequantizeLinearApply<T, float, is_4bit>().op(static_cast<size_t>(process_block_count),
                                                     static_cast<size_t>(broadcast_dim),
                                                     static_cast<size_t>(process_block_size),
                                                     static_cast<size_t>(block_size_),
                                                     input, scale, output, zero_point);
     } else {
+      std::cout << "b" << std::endl;
       DequantizeLinearApply<T, float, is_4bit>().op(static_cast<size_t>(process_block_count),
                                                     static_cast<size_t>(broadcast_dim),
                                                     static_cast<size_t>(process_block_size),
                                                     input, scale, output, zero_point);
     }
   } else if (to == ONNX_NAMESPACE::TensorProto::FLOAT16) {
+    std::cout << "c" << std::endl;
     const MLFloat16* scale = x_scale.Data<MLFloat16>();
     MLFloat16* output = y.MutableData<MLFloat16>();
     if (block_size_) {
@@ -523,16 +570,31 @@ Status DequantizeLinear<T>::Compute(OpKernelContext* ctx) const {
                                                         static_cast<size_t>(block_size_),
                                                         input, scale, output, zero_point);
     } else {
+      std::cout << "d" << std::endl;
       DequantizeLinearApply<T, MLFloat16, is_4bit>().op(static_cast<size_t>(process_block_count),
                                                         static_cast<size_t>(broadcast_dim),
                                                         static_cast<size_t>(process_block_size),
                                                         input, scale, output, zero_point);
     }
   } else if (to == ONNX_NAMESPACE::TensorProto::BFLOAT16) {
+    std::cout << "e" << std::endl;
     ORT_THROW("DequantizeLinear into BFLOAT16 is not implemented yet.");
   } else {
+    std::cout << "f" << std::endl;
     ORT_THROW("DequantizeLinear only outputs FLOAT16, FLOAT or BFLOAT16.");
   }
+
+  // Ferma il timer e calcola la durata
+  auto end = std::chrono::high_resolution_clock::now();
+  auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+
+  // Ottieni il nome del nodo direttamente da NodeName()
+  std::string node_name = ctx->GetNodeName();
+
+  // Stampa i risultati con il tipo e il nome del nodo
+  std::cout << "DequantizeLinear<" << typeid(T).name() << "> nodo '" << node_name << "' eseguito in "
+            << duration.count() << " microsec, shape: " << x_shape
+            << ", elementi: " << x_shape.Size() << std::endl;
 
   return Status::OK();
 }
@@ -782,6 +844,7 @@ DEFINE_COMPUTE_LOOP_FP16_TO_INT4(UInt4x2)
 // formula is Y = X / Scale + ZeroPoint
 template <typename T>
 Status QuantizeLinear<T>::Compute(OpKernelContext* ctx) const {
+  std::cout << "quantize linear" << std::endl;
   auto& x = *ctx->Input<Tensor>(0);
   auto& y_scale = *ctx->Input<Tensor>(1);
   auto* y_zero_point = ctx->Input<Tensor>(2);
@@ -807,18 +870,8 @@ Status QuantizeLinear<T>::Compute(OpKernelContext* ctx) const {
   if (x.IsDataType<float>()) {
     if (block_size_) {
       if (process_block_size > 1) {
-        BlockedQuantizeLinear<float, T, output_type_group_>::opNotLastAxis(
-            ctx->GetOperatorThreadPool(),
-            x.Data<float>(),
-            y_scale.Data<float>(),
-            zero_point,
-            output,
-            static_cast<std::ptrdiff_t>(process_block_count),
-            static_cast<std::ptrdiff_t>(broadcast_dim),
-            static_cast<std::ptrdiff_t>(process_block_size),
-            static_cast<std::ptrdiff_t>(block_size_),
-            128,
-            saturate_);
+        std::cout << "a" << std::endl;
+        BlockedQuantizeLinear<float, T, output_type_group_>::opNotLastAxis(ctx->GetOperatorThreadPool(), x.Data<float>(), y_scale.Data<float>(), zero_point, output, static_cast<std::ptrdiff_t>(process_block_count), static_cast<std::ptrdiff_t>(broadcast_dim), static_cast<std::ptrdiff_t>(process_block_size), static_cast<std::ptrdiff_t>(block_size_), 128, saturate_);
       } else {
         BlockedQuantizeLinear<float, T, output_type_group_>::opLastAxis(
             ctx->GetOperatorThreadPool(),
