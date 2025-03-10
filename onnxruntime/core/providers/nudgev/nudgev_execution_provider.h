@@ -13,6 +13,26 @@
 
 namespace onnxruntime {
 
+struct alignas(32) AddParams {
+  float input1_scale{};
+  int8_t input1_zp{};
+  float input2_scale{};
+  int8_t input2_zp{};
+  float output_scale{};
+  int8_t output_zp{};
+
+  int32_t M1_fixed{};
+  int32_t M2_fixed{};
+
+  int64_t batch_size{};
+  bool dynamic_batch{false};
+  std::vector<int64_t> input1_shape;
+  std::vector<int64_t> input2_shape;
+  std::vector<int64_t> output_shape;
+
+  bool fused_relu{false};
+};
+
 struct alignas(32) DequantizeLinearParams {
   int64_t batch_size{};
   int64_t channels{};
@@ -67,10 +87,10 @@ struct alignas(32) ConvQuantParams {
   int64_t output_width{};
   int64_t batch_size{};
 
-  size_t weights_ddr3_address = 0;  // Indirizzo dei pesi nella DDR3
-  size_t bias_ddr3_address = 0;     // Indirizzo dei bias nella DDR3
-  int64_t k_blocks = 0;             // Numero di blocchi K
-  int64_t oc_blocks = 0;            // Numero di blocchi OC
+  size_t weights_ddr3_address = 0;
+  size_t bias_ddr3_address = 0;
+  int64_t k_blocks = 0;
+  int64_t oc_blocks = 0;
 
   std::vector<int64_t> strides;
   std::vector<int64_t> pads;
@@ -164,6 +184,9 @@ class NudgevExecutionProvider : public IExecutionProvider {
   std::vector<std::unique_ptr<GemmParams>> saved_gemm_params_;
   std::vector<std::unique_ptr<DequantizeLinearParams>> saved_dequantize_params_;
   std::unordered_map<std::string, std::string> node_name_mapping_;
+
+  mutable std::unordered_map<std::string, AddParams> add_params_map_;
+  std::vector<std::unique_ptr<AddParams>> saved_add_params_;
 
   Status ParseProviderOptions(const ProviderOptions& provider_options_map);
   std::vector<std::unique_ptr<OpKernel>> kernels_;

@@ -1,5 +1,5 @@
 #include "core/providers/nudgev/nudgev_execution_provider.h"
-#include "core/providers/nudgev/operators/nudgev_conv.h"
+#include "core/providers/nudgev/operators/nudgev_add.h"
 #include "core/providers/nudgev/operators/nudgev_conv_accelerated.h"
 #include "core/providers/nudgev/operators/supported_ops.h"
 #include "core/providers/nudgev/operators/nudgev_gemm.h"
@@ -28,6 +28,32 @@
 namespace onnxruntime {
 
 static void RegisterNudgevKernels(KernelRegistry& kernel_registry) {
+  {
+    KernelDefBuilder def_builder;
+    auto create_fn = [](FuncManager& func_mgr, const OpKernelInfo& info, std::unique_ptr<OpKernel>& out) -> Status {
+      ORT_UNUSED_PARAMETER(func_mgr);
+      ORT_UNUSED_PARAMETER(info);
+      ORT_UNUSED_PARAMETER(out);
+      return Status::OK();
+    };
+
+    Status status = kernel_registry.Register(
+        def_builder
+            .SetName("Add")
+            .SetDomain(kOnnxDomain)
+            .SinceVersion(7)
+            .Provider(kNudgevExecutionProvider)
+            .TypeConstraint("T", DataTypeImpl::GetTensorType<int8_t>())
+            .MayInplace(0, 0)  // Permette l'esecuzione in-place per il primo input
+            .MayInplace(1, 0)  // Permette l'esecuzione in-place anche per il secondo input
+            .InputMemoryType(OrtMemTypeCPUOutput, 0)
+            .InputMemoryType(OrtMemTypeCPUOutput, 1)
+            .OutputMemoryType(OrtMemTypeCPUInput, 0),
+        create_fn);
+
+    ORT_ENFORCE(status.IsOK(), "Failed to register NUDGEV kernel for Add");
+  }
+
   {
     KernelDefBuilder def_builder;
     auto create_fn = [](FuncManager& func_mgr, const OpKernelInfo& info, std::unique_ptr<OpKernel>& out) -> Status {
@@ -884,6 +910,95 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
           false));
 
       handled_nodes.insert(node);
+    } else if (node->OpType() == "Add23") {
+      const Node* input1_dq = graph_viewer.GetProducerNode(node->InputDefs()[0]->Name());
+      const Node* input2_dq = graph_viewer.GetProducerNode(node->InputDefs()[1]->Name());
+      if (!input1_dq || input1_dq->OpType() != "DequantizeLinear" ||
+          !input2_dq || input2_dq->OpType() != "DequantizeLinear") {
+        continue;
+      }
+      AddParams params{};
+      const auto* shape_proto_1 = input1_dq->InputDefs()[0]->Shape();
+      const auto* shape_proto_2 = input2_dq->InputDefs()[0]->Shape();
+      const auto& input1_qparams = input1_dq->InputDefs();
+      const auto* input1_scale_init = initializers.at(input1_qparams[1]->Name());
+      const auto* input1_zp_init = initializers.at(input1_qparams[2]->Name());
+
+      if (input1_scale_init->has_raw_data()) {
+        params.input1_scale = *reinterpret_cast<const float*>(input1_scale_init->raw_data().data());
+      } else if (input1_scale_init->data_type() == ONNX_NAMESPACE::TensorProto_DataType_FLOAT) {
+        params.input1_scale = input1_scale_init->float_data().empty() ? 0.0f : input1_scale_init->float_data(0);
+      }
+
+      if (input1_zp_init->has_raw_data()) {
+        params.input1_zp = *reinterpret_cast<const int8_t*>(input1_zp_init->raw_data().data());
+      } else if (input1_zp_init->data_type() == ONNX_NAMESPACE::TensorProto_DataType_INT8) {
+        params.input1_zp = static_cast<int8_t>(input1_zp_init->int32_data().empty() ? 0 : input1_zp_init->int32_data(0));
+      }
+      const auto& input2_qparams = input2_dq->InputDefs();
+      const auto* input2_scale_init = initializers.at(input2_qparams[1]->Name());
+      const auto* input2_zp_init = initializers.at(input2_qparams[2]->Name());
+
+      if (input2_scale_init->has_raw_data()) {
+        params.input2_scale = *reinterpret_cast<const float*>(input2_scale_init->raw_data().data());
+      } else if (input2_scale_init->data_type() == ONNX_NAMESPACE::TensorProto_DataType_FLOAT) {
+        params.input2_scale = input2_scale_init->float_data().empty() ? 0.0f : input2_scale_init->float_data(0);
+      }
+
+      if (input2_zp_init->has_raw_data()) {
+        params.input2_zp = *reinterpret_cast<const int8_t*>(input2_zp_init->raw_data().data());
+      } else if (input2_zp_init->data_type() == ONNX_NAMESPACE::TensorProto_DataType_INT8) {
+        params.input2_zp = static_cast<int8_t>(input2_zp_init->int32_data().empty() ? 0 : input2_zp_init->int32_data(0));
+      }
+
+      const Node* output_q = nullptr;
+      auto add_consumers = graph_viewer.GetConsumerNodes(node->OutputDefs()[0]->Name());
+      if (!add_consumers.empty()) {
+        output_q = add_consumers[0];
+        if (output_q && output_q->OpType() == "QuantizeLinear") {
+          const auto& output_qparams = output_q->InputDefs();
+          const auto* output_scale_init = initializers.at(output_qparams[1]->Name());
+          const auto* output_zp_init = initializers.at(output_qparams[2]->Name());
+
+          if (output_scale_init->has_raw_data()) {
+            params.output_scale = *reinterpret_cast<const float*>(output_scale_init->raw_data().data());
+          } else if (output_scale_init->data_type() == ONNX_NAMESPACE::TensorProto_DataType_FLOAT) {
+            params.output_scale = output_scale_init->float_data().empty() ? 0.0f : output_scale_init->float_data(0);
+          }
+
+          if (output_zp_init->has_raw_data()) {
+            params.output_zp = *reinterpret_cast<const int8_t*>(output_zp_init->raw_data().data());
+          } else if (output_zp_init->data_type() == ONNX_NAMESPACE::TensorProto_DataType_INT8) {
+            params.output_zp = static_cast<int8_t>(output_zp_init->int32_data().empty() ? 0 : output_zp_init->int32_data(0));
+          }
+        }
+      }
+      std::cout << "BBB" << std::endl;
+      params.M1_fixed = static_cast<int32_t>((params.input1_scale / params.output_scale) * (1 << 15));
+      params.M2_fixed = static_cast<int32_t>((params.input2_scale / params.output_scale) * (1 << 15));
+
+      uint64_t model_hash;
+      int metadef_id = this->metadef_id_generator_.GenerateId(graph_viewer, model_hash);
+      auto node_name = MakeString("NudgevExecutionProvider_", model_hash, "_", metadef_id, "_", metadef_id);
+      std::cout << "GetCapability - Add node: " << node->Name()
+                << ", generating unique name: " << node_name
+                << std::endl;
+      add_params_map_[node_name] = std::move(params);
+      std::vector<const Node*> fused_nodes{input1_dq, input2_dq, node};
+      if (output_q && output_q->OpType() == "QuantizeLinear") {
+        fused_nodes.push_back(output_q);
+      }
+      result.push_back(utils::MakeComputeCapability(
+          graph_viewer,
+          fused_nodes,
+          [model_hash, metadef_id]() {
+            return MakeString(model_hash, "_", metadef_id);
+          },
+          kNudgevExecutionProvider,
+          false));
+
+      handled_nodes.insert(fused_nodes.begin(), fused_nodes.end());
+      continue;
     }
   }
   return result;
@@ -892,27 +1007,24 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
 Status NudgevExecutionProvider::Compile(
     const std::vector<FusedNodeAndGraph>& fused_nodes_and_graphs,
     std::vector<NodeComputeInfo>& node_compute_funcs) {
+  // std::cout << "Compile - Starting with " << fused_nodes_and_graphs.size() << " fused nodes." << std::endl;
   for (const auto& fused_node_and_graph : fused_nodes_and_graphs) {
     const Node& fused_node = fused_node_and_graph.fused_node;
     NodeComputeInfo compute_info;
-
+    /*
+    std::cout << "Compile - Fused node: " << fused_node.Name()
+              << ", OpType: " << fused_node.OpType()
+              << std::endl;
+    */
     if (quant_params_map_.find(fused_node.Name()) != quant_params_map_.end()) {
       auto it = quant_params_map_.find(fused_node.Name());
       if (it == quant_params_map_.end()) {
         return Status(common::ONNXRUNTIME, common::FAIL, "Conv parameters not found");
       }
-      /*
-      std::cout << "Compile - Before copy - Node: " << fused_node.Name()
-          << " weights_ddr3_address: 0x" << std::hex << it->second.weights_ddr3_address
-          << ", bias_ddr3_address: 0x" << it->second.bias_ddr3_address << std::dec << std::endl;
-      */
+
       auto kernel_params = std::make_unique<ConvQuantParams>(it->second);
       auto params_copy = kernel_params.get();
-      /*
-      std::cout << "Compile - After copy - Node: " << fused_node.Name()
-          << " weights_ddr3_address: 0x" << std::hex << params_copy->weights_ddr3_address
-          << ", bias_ddr3_address: 0x" << params_copy->bias_ddr3_address << std::dec << std::endl;
-      */
+
       compute_info.create_state_func = [params_copy](ComputeContext*, FunctionState* state) {
         *state = params_copy;
         return 0;
@@ -972,6 +1084,29 @@ Status NudgevExecutionProvider::Compile(
       };
 
       saved_dequantize_params_.push_back(std::move(kernel_params));
+    } else if (add_params_map_.find(fused_node.Name()) != add_params_map_.end()) {
+      auto it = add_params_map_.find(fused_node.Name());
+      if (it == add_params_map_.end()) {
+        return Status(common::ONNXRUNTIME, common::FAIL, "Add parameters not found");
+      }
+      auto kernel_params = std::make_unique<AddParams>(std::move(it->second));
+      auto params_copy = kernel_params.get();
+
+      compute_info.create_state_func = [params_copy](ComputeContext*, FunctionState* state) {
+        *state = params_copy;
+        return 0;
+      };
+
+      compute_info.release_state_func = [](FunctionState) {};
+
+      compute_info.compute_func = [](FunctionState state,
+                                     const OrtApi*,
+                                     OrtKernelContext* context) -> Status {
+        return onnxruntime::nudgev::ComputeNudgeVAdd(
+            static_cast<AddParams*>(state), context);
+      };
+
+      saved_add_params_.push_back(std::move(kernel_params));
     } else {
       return Status(common::ONNXRUNTIME, common::FAIL,
                     "Unsupported operator: " + fused_node.OpType());

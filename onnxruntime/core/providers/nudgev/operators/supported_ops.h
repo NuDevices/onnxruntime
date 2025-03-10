@@ -10,10 +10,7 @@ const std::unordered_set<std::string> kSupportedQuantizedOps = {
     "Conv",
     "Gemm",
     "Add",
-    "MaxPool"
-    // Add other supported quantized operators here
-    // For example, "Add", "MatMul", "MaxPool", "AveragePool", etc.
-};
+    "MaxPool"};
 
 inline bool IsQuantizedOperatorSupported(const std::string& op_type) {
   return kSupportedQuantizedOps.find(op_type) != kSupportedQuantizedOps.end();

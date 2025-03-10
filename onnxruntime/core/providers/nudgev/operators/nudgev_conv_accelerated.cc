@@ -837,6 +837,7 @@ void gemm_with_accelerator(
     onnxruntime::concurrency::ThreadPool* tp) {
   ORT_UNUSED_PARAMETER(tp);
   ORT_UNUSED_PARAMETER(weight_zero_point);
+  ORT_UNUSED_PARAMETER(k_blocks);
 
   const int64_t block_size = 32;
   const int16_t multiplier = static_cast<int16_t>(M_fixed);
@@ -862,9 +863,6 @@ void gemm_with_accelerator(
 
   int64_t J = (patches_per_image + block_size - 1) / block_size;
   std::atomic<bool> should_stop(false);
-  std::atomic<size_t> packets_sent(0);
-  std::atomic<size_t> packets_received(0);
-  std::mutex output_mutex;
 
   mock::MatrixMultiplicationHeader header;
   header.xzp = static_cast<uint8_t>(input_zero_point);
@@ -884,6 +882,7 @@ void gemm_with_accelerator(
   size_t total_input_size = batch_size * J * block_data_size;
   std::vector<int8_t> reorganized_input(total_input_size, 0);
 
+  // Preparazione dei dati - questa parte rimane sequenziale
   for (int64_t b = 0; b < batch_size; b++) {
     for (int64_t j = 0; j < J; j++) {
       size_t block_offset = (b * J + j) * block_data_size;
@@ -914,8 +913,70 @@ void gemm_with_accelerator(
       }
     }
   }
+
+  // Lancio un thread separato per la lettura dei risultati in parallelo
+  std::thread receiver_thread;
+  std::vector<int8_t> result_data;
+  std::mutex result_mutex;
+  std::condition_variable result_cv;
+  bool reading_complete = false;
+
+  receiver_thread = std::thread([&]() {
+    int64_t received_batch;
+    if (read(device_to_host_fd[0], &received_batch, sizeof(received_batch)) != sizeof(received_batch)) {
+      std::cerr << "Error: failed to read batch index from results" << std::endl;
+      should_stop.store(true);
+      return;
+    }
+
+    uint32_t result_size;
+    if (read(device_to_host_fd[0], &result_size, sizeof(result_size)) != sizeof(result_size)) {
+      std::cerr << "Error: failed to read result size" << std::endl;
+      should_stop.store(true);
+      return;
+    }
+    size_t expected_size = static_cast<size_t>(J * batch_size * oc_blocks * block_size * block_size);
+    if (result_size != expected_size) {
+      std::cerr << "Warning: Received result size (" << result_size
+                << ") differs from expected size (" << expected_size << ")" << std::endl;
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(result_mutex);
+      result_data.resize(result_size);
+    }
+
+    size_t bytes_read = 0;
+    while (bytes_read < result_size && !should_stop.load()) {
+      ssize_t result = read(device_to_host_fd[0],
+                            result_data.data() + bytes_read,
+                            result_size - bytes_read);
+
+      if (result <= 0) {
+        std::cerr << "Error: failed to read result data. Read " << bytes_read
+                  << " of " << result_size << " bytes. Errno: " << errno
+                  << " (" << strerror(errno) << ")" << std::endl;
+        should_stop.store(true);
+        return;
+      }
+
+      bytes_read += result;
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(result_mutex);
+      reading_complete = true;
+      result_cv.notify_one();
+    }
+  });
+
+  // Thread principale continua con l'invio dei dati
   if (write(host_to_device_fd[1], &header, sizeof(header)) != sizeof(header)) {
     std::cerr << "Error: failed to write header to accelerator" << std::endl;
+    should_stop.store(true);
+    if (receiver_thread.joinable()) {
+      receiver_thread.join();
+    }
     close(host_to_device_fd[0]);
     close(host_to_device_fd[1]);
     close(device_to_host_fd[0]);
@@ -923,9 +984,14 @@ void gemm_with_accelerator(
     accel_sim.shutdown();
     return;
   }
+
   int64_t all_batches = 0;  // Marker that we're sending all batches
   if (write(host_to_device_fd[1], &all_batches, sizeof(all_batches)) != sizeof(all_batches)) {
     std::cerr << "Error: failed to write batch index to accelerator" << std::endl;
+    should_stop.store(true);
+    if (receiver_thread.joinable()) {
+      receiver_thread.join();
+    }
     close(host_to_device_fd[0]);
     close(host_to_device_fd[1]);
     close(device_to_host_fd[0]);
@@ -933,9 +999,14 @@ void gemm_with_accelerator(
     accel_sim.shutdown();
     return;
   }
+
   uint32_t data_size = static_cast<uint32_t>(reorganized_input.size());
   if (write(host_to_device_fd[1], &data_size, sizeof(data_size)) != sizeof(data_size)) {
     std::cerr << "Error: failed to write data size to accelerator" << std::endl;
+    should_stop.store(true);
+    if (receiver_thread.joinable()) {
+      receiver_thread.join();
+    }
     close(host_to_device_fd[0]);
     close(host_to_device_fd[1]);
     close(device_to_host_fd[0]);
@@ -943,8 +1014,10 @@ void gemm_with_accelerator(
     accel_sim.shutdown();
     return;
   }
+
+  // Invio chunked dei dati per evitare problemi di buffer overflow
   size_t bytes_written = 0;
-  while (bytes_written < data_size) {
+  while (bytes_written < data_size && !should_stop.load()) {
     size_t chunk_size = std::min(static_cast<size_t>(65536), data_size - bytes_written);
     ssize_t result = write(host_to_device_fd[1],
                            reorganized_input.data() + bytes_written,
@@ -954,14 +1027,19 @@ void gemm_with_accelerator(
       std::cerr << "Error: failed to write data chunk. Wrote " << bytes_written
                 << " of " << data_size << " bytes. Errno: " << errno
                 << " (" << strerror(errno) << ")" << std::endl;
+      should_stop.store(true);
       break;
     }
 
     bytes_written += result;
   }
 
-  if (bytes_written != data_size) {
+  if (bytes_written != data_size && !should_stop.load()) {
     std::cerr << "Error: incomplete data write: " << bytes_written << " of " << data_size << " bytes" << std::endl;
+    should_stop.store(true);
+    if (receiver_thread.joinable()) {
+      receiver_thread.join();
+    }
     close(host_to_device_fd[0]);
     close(host_to_device_fd[1]);
     close(device_to_host_fd[0]);
@@ -970,9 +1048,14 @@ void gemm_with_accelerator(
     return;
   }
 
+  // Invio degli indirizzi di pesi e bias
   if (write(host_to_device_fd[1], &weights_ddr3_address, sizeof(weights_ddr3_address)) != sizeof(weights_ddr3_address) ||
       write(host_to_device_fd[1], &bias_ddr3_address, sizeof(bias_ddr3_address)) != sizeof(bias_ddr3_address)) {
     std::cerr << "Error: failed to write addresses to accelerator" << std::endl;
+    should_stop.store(true);
+    if (receiver_thread.joinable()) {
+      receiver_thread.join();
+    }
     close(host_to_device_fd[0]);
     close(host_to_device_fd[1]);
     close(device_to_host_fd[0]);
@@ -981,8 +1064,13 @@ void gemm_with_accelerator(
     return;
   }
 
+  // Invio del flag fused_relu
   if (write(host_to_device_fd[1], &fused_relu, sizeof(fused_relu)) != sizeof(fused_relu)) {
     std::cerr << "Error: failed to write fused_relu flag to accelerator" << std::endl;
+    should_stop.store(true);
+    if (receiver_thread.joinable()) {
+      receiver_thread.join();
+    }
     close(host_to_device_fd[0]);
     close(host_to_device_fd[1]);
     close(device_to_host_fd[0]);
@@ -992,44 +1080,20 @@ void gemm_with_accelerator(
   }
 
   fsync(host_to_device_fd[1]);
-  packets_sent++;
 
-  auto receiver_thread = std::thread([&]() {
-    int64_t received_batch;
-    if (read(device_to_host_fd[0], &received_batch, sizeof(received_batch)) != sizeof(received_batch)) {
-      std::cerr << "Error: failed to read batch index from results" << std::endl;
-      return;
-    }
+  // Libero i dati di input che non servono più
+  std::vector<int8_t>().swap(reorganized_input);
 
-    uint32_t result_size;
-    if (read(device_to_host_fd[0], &result_size, sizeof(result_size)) != sizeof(result_size)) {
-      std::cerr << "Error: failed to read result size" << std::endl;
-      return;
-    }
-    size_t expected_size = static_cast<size_t>(J * batch_size * oc_blocks * block_size * block_size);
-    if (result_size != expected_size) {
-      std::cerr << "Warning: Received result size (" << result_size
-                << ") differs from expected size (" << expected_size << ")" << std::endl;
-    }
+  // Aspetto che il thread di lettura completi
+  {
+    std::unique_lock<std::mutex> lock(result_mutex);
+    result_cv.wait(lock, [&reading_complete]() { return reading_complete; });
+  }
 
-    std::vector<int8_t> result_data(result_size);
-    size_t bytes_read = 0;
-    while (bytes_read < result_size) {
-      ssize_t result = read(device_to_host_fd[0],
-                            result_data.data() + bytes_read,
-                            result_size - bytes_read);
-
-      if (result <= 0) {
-        std::cerr << "Error: failed to read result data. Read " << bytes_read
-                  << " of " << result_size << " bytes. Errno: " << errno
-                  << " (" << strerror(errno) << ")" << std::endl;
-        return;
-      }
-
-      bytes_read += result;
-    }
+  // Adesso che la lettura è completata, elaboro i risultati
+  if (!should_stop.load()) {
     std::memset(output, 0, batch_size * patches_per_image * OC * sizeof(int8_t));
-    int64_t max_blocks = result_size / (oc_blocks * block_size * block_size);
+    int64_t max_blocks = result_data.size() / (oc_blocks * block_size * block_size);
 
     for (int64_t b = 0; b < batch_size; b++) {
       for (int64_t j = 0; j < J; j++) {
@@ -1039,17 +1103,18 @@ void gemm_with_accelerator(
 
         int64_t block_idx = b * J + j;
         if (block_idx >= max_blocks) {
-          std::cout << "  AVVISO: Salto blocco fuori dai limiti: " << block_idx
+          std::cout << "  Warning: Skipping out-of-bounds block: " << block_idx
                     << " (max: " << max_blocks << ")" << std::endl;
           continue;
         }
+
         for (int64_t ocb = 0; ocb < oc_blocks; ocb++) {
           int64_t oc_base = ocb * block_size;
           int64_t valid_oc = std::min(block_size, OC - oc_base);
 
           size_t block_offset = (block_idx * oc_blocks + ocb) * block_size * block_size;
           if (block_offset + block_size * block_size > result_data.size()) {
-            std::cout << "  AVVISO: Salto offset blocco fuori dai limiti: " << block_offset
+            std::cout << "  Warning: Skipping out-of-bounds block offset: " << block_offset
                       << " (max: " << result_data.size() << ")" << std::endl;
             continue;
           }
@@ -1066,12 +1131,12 @@ void gemm_with_accelerator(
         }
       }
     }
+  }
 
-    packets_received++;
-  });
   if (receiver_thread.joinable()) {
     receiver_thread.join();
   }
+
   accel_sim.shutdown();
   close(host_to_device_fd[0]);
   close(host_to_device_fd[1]);
