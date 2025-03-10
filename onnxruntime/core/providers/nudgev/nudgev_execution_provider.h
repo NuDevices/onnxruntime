@@ -100,6 +100,9 @@ struct alignas(32) ConvQuantParams {
   std::string auto_pad;
   std::string node_name;
 
+  int weights_bias_fd = -1;     
+  static constexpr size_t BIAS_OFFSET = 100 * 1024 * 1024;
+
   alignas(32) std::vector<int8_t> weights;
   alignas(32) std::vector<int32_t> bias;
   alignas(32) std::vector<int8_t> im2col_buffer;
@@ -159,7 +162,7 @@ class NudgevExecutionProvider : public IExecutionProvider {
   explicit NudgevExecutionProvider(const ProviderOptions& provider_options_map,
                                    const SessionOptions* session_options = nullptr);
 
-  ~NudgevExecutionProvider() override = default;
+  ~NudgevExecutionProvider() override;
 
   FusionStyle GetFusionStyle() const override {
     return FusionStyle::FilteredGraphViewer;

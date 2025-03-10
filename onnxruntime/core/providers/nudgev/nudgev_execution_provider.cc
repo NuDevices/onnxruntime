@@ -22,6 +22,10 @@
 #include "core/platform/threadpool.h"
 #include "core/platform/ort_mutex.h"
 #include <algorithm>
+#include <unistd.h>    
+#include <fcntl.h>    
+#include <sys/stat.h> 
+#include <errno.h>     
 
 #include "core/providers/nudgev/mock/mock_accelerator_memory.h"
 
@@ -237,6 +241,14 @@ DataLayout NudgevExecutionProvider::GetPreferredLayout() const {
   return DataLayout::NCHW;
 }
 
+NudgevExecutionProvider::~NudgevExecutionProvider() {
+  for (const auto& param : saved_conv_params_) {
+    if (param->weights_bias_fd >= 0) {
+      close(param->weights_bias_fd);
+    }
+  }
+}
+
 std::vector<std::unique_ptr<ComputeCapability>>
 NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
                                        const IKernelLookup& /*kernel_lookup*/) const {
@@ -259,12 +271,12 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
     if (node->OpType() == "Conv") {
       ConvQuantParams params{};
       const auto& attributes = node->GetAttributes();
-
+    
       // Check if Conv is fused with Relu
       std::string conv_output_name = node->OutputDefs()[0]->Name();
       bool has_relu = conv_output_name.find("Relu") != std::string::npos;
       params.fused_relu = has_relu;
-
+    
       // Get strides
       if (attributes.find("strides") != attributes.end()) {
         const auto& strides_attr = attributes.at("strides").ints();
@@ -272,7 +284,7 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
       } else {
         params.strides = {1, 1};
       }
-
+    
       // Get pads
       if (attributes.find("pads") != attributes.end()) {
         const auto& pads_attr = attributes.at("pads").ints();
@@ -280,7 +292,7 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
       } else {
         params.pads = {0, 0, 0, 0};
       }
-
+    
       // Get dilations
       if (attributes.find("dilations") != attributes.end()) {
         const auto& dilations_attr = attributes.at("dilations").ints();
@@ -288,35 +300,35 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
       } else {
         params.dilations = {1, 1};
       }
-
+    
       // Get group
       if (attributes.find("group") != attributes.end()) {
         params.group = attributes.at("group").i();
       } else {
         params.group = 1;
       }
-
+    
       // Get auto_pad
       if (attributes.find("auto_pad") != attributes.end()) {
         params.auto_pad = attributes.at("auto_pad").s();
       } else {
         params.auto_pad = "NOTSET";
       }
-
+    
       // Input parameters (DequantizeLinear)
       const Node* input_dq = graph_viewer.GetProducerNode(node->InputDefs()[0]->Name());
       if (!input_dq || input_dq->OpType() != "DequantizeLinear" ||
           handled_nodes.find(input_dq) != handled_nodes.end()) {
         continue;
       }
-
+    
       // Weight parameters (DequantizeLinear)
       const Node* weight_dq = graph_viewer.GetProducerNode(node->InputDefs()[1]->Name());
       if (!weight_dq || weight_dq->OpType() != "DequantizeLinear" ||
           handled_nodes.find(weight_dq) != handled_nodes.end()) {
         continue;
       }
-
+    
       // Get weights dimensions first
       const auto* weight_tensor = initializers.at(weight_dq->InputDefs()[0]->Name());
       const auto& weight_dims = weight_tensor->dims();
@@ -324,27 +336,27 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
       const int64_t IC = weight_dims[1];
       const int64_t KH = weight_dims[2];
       const int64_t KW = weight_dims[3];
-
+    
       // Get input shape
       const auto* shape_proto = input_dq->InputDefs()[0]->Shape();
       const int64_t initial_batch_size = shape_proto->dim(0).dim_value();
       const int64_t input_channels = shape_proto->dim(1).dim_value();
       const int64_t input_height = shape_proto->dim(2).dim_value();
       const int64_t input_width = shape_proto->dim(3).dim_value();
-
+    
       // Calculate oh and ow shapes
       params.output_height = static_cast<int64_t>(std::floor(
           (input_height + params.pads[0] + params.pads[2] - KH) / static_cast<double>(params.strides[0]) + 1));
-
+    
       params.output_width = static_cast<int64_t>(std::floor(
           (input_width + params.pads[1] + params.pads[3] - KW) / static_cast<double>(params.strides[1]) + 1));
-
+    
       int64_t effective_batch_size = initial_batch_size;
       if (initial_batch_size == 0) {
         effective_batch_size = 8;
         params.dynamic_batch = true;
       }
-
+    
       const int64_t max_padded_height = input_height + params.pads[0] + params.pads[2];
       const int64_t max_padded_width = input_width + params.pads[1] + params.pads[3];
       params.N = effective_batch_size * params.output_height * params.output_width;
@@ -354,7 +366,7 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
       const size_t padded_input = effective_batch_size * input_channels * max_padded_height * max_padded_width;
       params.padded_buffer.resize(padded_input);
       params.temp_buffer.resize(temp_buffer_size);
-
+    
       const auto& input_qparams = input_dq->InputDefs();
       const auto* input_scale_init = initializers.at(input_qparams[1]->Name());
       const auto* input_zp_init = initializers.at(input_qparams[2]->Name());
@@ -364,47 +376,47 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
           effective_batch_size,
           params.output_height,
           params.output_width);
-
+    
       if (!status.IsOK()) {
         return result;
       }
-
+    
       // Input scale
       if (input_scale_init->has_raw_data()) {
         params.input_scale = *reinterpret_cast<const float*>(input_scale_init->raw_data().data());
       } else if (input_scale_init->data_type() == ONNX_NAMESPACE::TensorProto_DataType_FLOAT) {
         params.input_scale = input_scale_init->float_data().empty() ? 0.0f : input_scale_init->float_data(0);
       }
-
+    
       // Input zero point
       if (input_zp_init->has_raw_data()) {
         params.input_zp = *reinterpret_cast<const int8_t*>(input_zp_init->raw_data().data());
       } else if (input_zp_init->data_type() == ONNX_NAMESPACE::TensorProto_DataType_INT8) {
         params.input_zp = static_cast<int8_t>(input_zp_init->int32_data().empty() ? 0 : input_zp_init->int32_data(0));
       }
-
+    
       const auto& weight_qparams = weight_dq->InputDefs();
       const auto* weight_scale_init = initializers.at(weight_qparams[1]->Name());
       const auto* weight_zp_init = initializers.at(weight_qparams[2]->Name());
-
+    
       // Weight scale
       if (weight_scale_init->has_raw_data()) {
         params.weight_scale = *reinterpret_cast<const float*>(weight_scale_init->raw_data().data());
       } else if (weight_scale_init->data_type() == ONNX_NAMESPACE::TensorProto_DataType_FLOAT) {
         params.weight_scale = weight_scale_init->float_data().empty() ? 0.0f : weight_scale_init->float_data(0);
       }
-
+    
       // Weight zero point
       if (weight_zp_init->has_raw_data()) {
         params.weight_zp = *reinterpret_cast<const int8_t*>(weight_zp_init->raw_data().data());
       } else if (weight_zp_init->data_type() == ONNX_NAMESPACE::TensorProto_DataType_INT8) {
         params.weight_zp = static_cast<int8_t>(weight_zp_init->int32_data().empty() ? 0 : weight_zp_init->int32_data(0));
       }
-
+    
       // Get quantized weights and reshape them
       params.weight_shape = std::vector<int64_t>{OC, IC, KH, KW};
       std::vector<int8_t> original_weights;
-
+    
       if (weight_tensor->has_raw_data()) {
         const auto& raw_data = weight_tensor->raw_data();
         original_weights.assign(
@@ -417,12 +429,12 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
           original_weights.push_back(static_cast<int8_t>(val));
         }
       }
-
+    
       params.weights.resize(OC * IC * KH * KW);
       for (int64_t i = 0; i < OC * IC * KH * KW; ++i) {
         params.weights[i] = static_cast<int8_t>(original_weights[i] - params.weight_zp);
       }
-
+    
       // Bias parameters (optional DequantizeLinear)
       params.has_bias = false;
       const Node* bias_dq = nullptr;
@@ -444,13 +456,13 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
           const auto& bias_qparams = bias_dq->InputDefs();
           const auto* bias_scale_init = initializers.at(bias_qparams[1]->Name());
           const auto* bias_zp_init = initializers.at(bias_qparams[2]->Name());
-
+    
           if (bias_scale_init->has_raw_data()) {
             params.bias_scale = *reinterpret_cast<const float*>(bias_scale_init->raw_data().data());
           } else if (bias_scale_init->data_type() == ONNX_NAMESPACE::TensorProto_DataType_FLOAT) {
             params.bias_scale = bias_scale_init->float_data().empty() ? 0.0f : bias_scale_init->float_data(0);
           }
-
+    
           if (bias_zp_init->has_raw_data()) {
             params.bias_zp = *reinterpret_cast<const int8_t*>(bias_zp_init->raw_data().data());
           } else if (bias_zp_init->data_type() == ONNX_NAMESPACE::TensorProto_DataType_INT8) {
@@ -458,7 +470,7 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
           }
         }
       }
-
+    
       // Get output quantization parameters from the next QuantizeLinear node
       const Node* output_q = nullptr;
       auto conv_consumers = graph_viewer.GetConsumerNodes(node->OutputDefs()[0]->Name());
@@ -468,7 +480,7 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
           const auto& output_qparams = output_q->InputDefs();
           const auto* output_scale_init = initializers.at(output_qparams[1]->Name());
           const auto* output_zp_init = initializers.at(output_qparams[2]->Name());
-
+    
           // Output scale
           if (output_scale_init->has_raw_data()) {
             params.output_scale = *reinterpret_cast<const float*>(output_scale_init->raw_data().data());
@@ -483,32 +495,26 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
           }
         }
       }
-
+    
       float M = params.input_scale * params.weight_scale / params.output_scale;
       params.M_fixed = static_cast<int32_t>(M * (1 << 15));
       params.M = params.input_scale * params.weight_scale / params.output_scale;
       std::fill(params.padded_buffer.begin(), params.padded_buffer.end(), params.input_zp);
       params.node_name = node->Name();
-
+    
       const int64_t K = IC * KH * KW;
       const int64_t block_size = 32;
-
+    
       int64_t k_blocks = (K + block_size - 1) / block_size;
       int64_t oc_blocks = (OC + block_size - 1) / block_size;
-
-      // Initialize memory manager
-      auto& mem_manager = nudgev::mock::AcceleratorMemoryManager::getInstance();
-      static bool memory_initialized = false;
-      if (!memory_initialized) {
-        constexpr size_t MEMORY_SIZE = 2ULL * 1024 * 1024 * 1024;
-        constexpr size_t BIAS_OFFSET = 100ULL * 1024 * 1024;
-        mem_manager.initialize(MEMORY_SIZE, BIAS_OFFSET);
-        memory_initialized = true;
+    
+      int weights_bias_fd = open("/dev/xdma0_bypass", O_RDWR);
+      if (weights_bias_fd == -1) {
+        std::cerr << "Error: failed to open /dev/xdma0_bypass, errno=" << errno << std::endl;
+        return result;
       }
-
+    
       size_t weights_size = k_blocks * oc_blocks * block_size * block_size;
-      size_t weights_address = mem_manager.allocate_weights_memory(weights_size);
-
       std::vector<int8_t> fully_transposed(K * OC, 0);
       for (int64_t oc = 0; oc < OC; oc++) {
         for (int64_t k = 0; k < K; k++) {
@@ -518,7 +524,6 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
         }
       }
       std::vector<int8_t> blocked_weights(weights_size, 0);
-
       for (int64_t kb = 0; kb < k_blocks; kb++) {
         for (int64_t ocb = 0; ocb < oc_blocks; ocb++) {
           int64_t block_idx = kb * oc_blocks + ocb;
@@ -536,53 +541,39 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
           }
         }
       }
-      bool weights_written = mem_manager.write_to_memory(
-          weights_address,
-          blocked_weights.data(),
-          blocked_weights.size());
-
-      if (!weights_written) {
-        std::cerr << "Error: failed to write weights to accelerator memory" << std::endl;
+      lseek(weights_bias_fd, 0, SEEK_SET);
+      ssize_t weights_written = write(weights_bias_fd, blocked_weights.data(), blocked_weights.size());
+      if (weights_written != static_cast<ssize_t>(blocked_weights.size())) {
+        std::cerr << "Error: failed to write weights to file, errno=" << errno 
+                  << ", written=" << weights_written 
+                  << ", expected=" << blocked_weights.size() << std::endl;
+        close(weights_bias_fd);
         return result;
       }
-      size_t bias_address = 0;
       if (params.has_bias) {
-        size_t bias_size = oc_blocks * block_size * sizeof(int32_t);
-        bias_address = mem_manager.allocate_bias_memory(bias_size);
         std::vector<int32_t> bias_blocks(oc_blocks * block_size, 0);
-
         for (int64_t ocb = 0; ocb < oc_blocks; ocb++) {
           for (int64_t oc_offset = 0; oc_offset < block_size; oc_offset++) {
             int64_t oc_idx = ocb * block_size + oc_offset;
-
             if (oc_idx < OC) {
               bias_blocks[ocb * block_size + oc_offset] = params.bias[oc_idx];
             }
           }
         }
-        bool bias_written = mem_manager.write_to_memory(
-            bias_address,
-            bias_blocks.data(),
-            bias_blocks.size() * sizeof(int32_t));
-
-        if (!bias_written) {
-          std::cerr << "Error: failed to write bias to accelerator memory" << std::endl;
+        lseek(weights_bias_fd, params.BIAS_OFFSET, SEEK_SET);
+        ssize_t bias_written = write(weights_bias_fd, bias_blocks.data(), bias_blocks.size() * sizeof(int32_t));
+        if (bias_written != static_cast<ssize_t>(bias_blocks.size() * sizeof(int32_t))) {
+          std::cerr << "Error: failed to write bias to file, errno=" << errno 
+                    << ", written=" << bias_written 
+                    << ", expected=" << (bias_blocks.size() * sizeof(int32_t)) << std::endl;
+          close(weights_bias_fd);
           return result;
         }
       }
-      params.weights_ddr3_address = weights_address;
-      params.bias_ddr3_address = bias_address;
+      params.weights_bias_fd = weights_bias_fd;
       params.k_blocks = k_blocks;
       params.oc_blocks = oc_blocks;
-
-      /*
-      std::cout << "GetCapability - Node: " << node->Name()
-      << " weights_ddr3_address: 0x" << std::hex << params.weights_ddr3_address
-      << ", bias_ddr3_address: 0x" << params.bias_ddr3_address << std::dec
-      << ", k_blocks: " << params.k_blocks
-      << ", oc_blocks: " << params.oc_blocks << std::endl;
-      */
-
+    
       std::vector<const Node*> fused_nodes{input_dq, weight_dq, node};
       if (bias_dq) {
         fused_nodes.push_back(bias_dq);
@@ -590,13 +581,13 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
       if (output_q && output_q->OpType() == "QuantizeLinear") {
         fused_nodes.push_back(output_q);
       }
-
+    
       uint64_t model_hash;
       int metadef_id = this->metadef_id_generator_.GenerateId(graph_viewer, model_hash);
-
+    
       auto node_name = MakeString("NudgevExecutionProvider_", model_hash, "_", metadef_id, "_", metadef_id);
       quant_params_map_[node_name] = std::move(params);
-
+    
       result.push_back(utils::MakeComputeCapability(
           graph_viewer,
           fused_nodes,
@@ -605,7 +596,7 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
           },
           kNudgevExecutionProvider,
           false));
-
+    
       handled_nodes.insert(fused_nodes.begin(), fused_nodes.end());
       continue;
     } else if (node->OpType() == "Gemm") {

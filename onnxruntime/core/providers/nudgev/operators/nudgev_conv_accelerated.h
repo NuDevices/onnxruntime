@@ -26,12 +26,8 @@ void gemm_with_accelerator(
     int32_t M_fixed,
     int8_t output_zero_point,
     int8_t input_zero_point,
-    int8_t weight_zero_point,
-    size_t weights_ddr3_address,
-    size_t bias_ddr3_address,
     int64_t k_blocks,
     int64_t oc_blocks,
-    bool fused_relu,
     onnxruntime::concurrency::ThreadPool* tp);
 
 Status ComputeNudgeVConvWithAccelerator(ConvQuantParams* conv_params, OrtKernelContext* context);

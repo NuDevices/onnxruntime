@@ -819,281 +819,191 @@ void acc_im2col(
 }
 
 void gemm_with_accelerator(
-    const int8_t* im2col_output,
-    int8_t* output,
-    int64_t OC,
-    int64_t K,
-    int64_t patches_per_image,
-    int64_t batch_size,
-    int32_t M_fixed,
-    int8_t output_zero_point,
-    int8_t input_zero_point,
-    int8_t weight_zero_point,
-    size_t weights_ddr3_address,
-    size_t bias_ddr3_address,
-    int64_t k_blocks,
-    int64_t oc_blocks,
-    bool fused_relu,
-    onnxruntime::concurrency::ThreadPool* tp) {
-  ORT_UNUSED_PARAMETER(tp);
-  ORT_UNUSED_PARAMETER(weight_zero_point);
-  ORT_UNUSED_PARAMETER(k_blocks);
+  const int8_t* im2col_output,
+  int8_t* output,
+  int64_t OC,
+  int64_t K,
+  int64_t patches_per_image,
+  int64_t batch_size,
+  int32_t M_fixed,
+  int8_t output_zero_point,
+  int8_t input_zero_point,
+  int64_t k_blocks,
+  int64_t oc_blocks,
+  onnxruntime::concurrency::ThreadPool* tp) {
+ORT_UNUSED_PARAMETER(tp);
 
-  const int64_t block_size = 32;
-  const int16_t multiplier = static_cast<int16_t>(M_fixed);
-  const bool debug_mode = false;
+const int64_t block_size = 32;
+const int16_t multiplier = static_cast<int16_t>(M_fixed);
+const bool debug_mode = false;
 
-  auto start_time = std::chrono::high_resolution_clock::now();
-  int host_to_device_fd[2];
-  int device_to_host_fd[2];
-  if (pipe(host_to_device_fd) < 0 || pipe(device_to_host_fd) < 0) {
-    std::cerr << "Error: failed to create pipes for accelerator communication" << std::endl;
-    return;
-  }
-  int buffer_size = 4 * 1024 * 1024;
-  fcntl(host_to_device_fd[1], F_SETPIPE_SZ, buffer_size);
-  fcntl(device_to_host_fd[1], F_SETPIPE_SZ, buffer_size);
-  fcntl(device_to_host_fd[0], F_SETPIPE_SZ, buffer_size);
+auto start_time = std::chrono::high_resolution_clock::now();
 
-  int actual_buffer_size = fcntl(host_to_device_fd[1], F_GETPIPE_SZ);
-  ORT_UNUSED_PARAMETER(actual_buffer_size);
+int device_write_fd = open("/dev/xdma_h2c_0", O_WRONLY);
+int device_read_fd = open("/dev/xdma0_c2h_0", O_RDONLY);
 
-  auto& accel_sim = mock::AcceleratorHardwareSimulator::getInstance();
-  accel_sim.initialize(host_to_device_fd[0], device_to_host_fd[1], debug_mode);
+if (device_write_fd < 0 || device_read_fd < 0) {
+  std::cerr << "Error: failed to open accelerator device files. Write FD: " 
+            << device_write_fd << ", Read FD: " << device_read_fd 
+            << ", errno: " << errno << " (" << strerror(errno) << ")" << std::endl;
+  return;
+}
 
-  int64_t J = (patches_per_image + block_size - 1) / block_size;
-  std::atomic<bool> should_stop(false);
+int64_t J = (patches_per_image + block_size - 1) / block_size;
+std::atomic<bool> should_stop(false);
+std::atomic<size_t> packets_sent(0);
+std::atomic<size_t> packets_received(0);
+std::mutex output_mutex;
 
-  mock::MatrixMultiplicationHeader header;
-  header.xzp = static_cast<uint8_t>(input_zero_point);
-  header.yzp = static_cast<uint8_t>(output_zero_point);
-  header.m_lsb = multiplier & 0xFF;
-  header.m_msb = (multiplier >> 8) & 0xFF;
-  header.n_lsb = K & 0xFF;
-  header.n_msb = (K >> 8) & 0xFF;
-  header.k = oc_blocks;
-  header.j_lsb = J & 0xFF;
-  header.j_msb = (J >> 8) & 0xFF;
-  header.batch_size = batch_size;
-  header.reserved1 = 0;
-  header.reserved2 = 0;
+mock::MatrixMultiplicationHeader header;
+header.xzp = static_cast<uint8_t>(input_zero_point);
+header.yzp = static_cast<uint8_t>(output_zero_point);
+header.m_lsb = multiplier & 0xFF;
+header.m_msb = (multiplier >> 8) & 0xFF;
+header.n_lsb = K & 0xFF;
+header.n_msb = (K >> 8) & 0xFF;
+header.k = oc_blocks;
+header.j_lsb = J & 0xFF;
+header.j_msb = (J >> 8) & 0xFF;
+header.batch_size = batch_size;
+header.reserved1 = 0;
+header.reserved2 = 0;
 
-  size_t block_data_size = K * block_size * sizeof(int8_t);
-  size_t total_input_size = batch_size * J * block_data_size;
-  std::vector<int8_t> reorganized_input(total_input_size, 0);
+size_t block_data_size = K * block_size * sizeof(int8_t);
+size_t total_input_size = batch_size * J * block_data_size;
+std::vector<int8_t> reorganized_input(total_input_size, 0);
 
-  // Preparazione dei dati - questa parte rimane sequenziale
-  for (int64_t b = 0; b < batch_size; b++) {
-    for (int64_t j = 0; j < J; j++) {
-      size_t block_offset = (b * J + j) * block_data_size;
-      int64_t valid_patches = std::min(block_size, patches_per_image - j * block_size);
-      for (int64_t k = 0; k < K; k++) {
-        size_t dst_row_offset = block_offset + k * block_size;
-        size_t src_row_offset = b * K * patches_per_image + k * patches_per_image + j * block_size;
-        if (src_row_offset + valid_patches > static_cast<size_t>(batch_size * K * patches_per_image) ||
-            dst_row_offset + valid_patches > reorganized_input.size()) {
-          std::cerr << "  ERRORE: Indici non validi durante la riorganizzazione dell'input:" << std::endl;
-          std::cerr << "    src_row_offset: " << src_row_offset
-                    << ", dst_row_offset: " << dst_row_offset
-                    << ", valid_patches: " << valid_patches
-                    << ", input size: " << batch_size * K * patches_per_image
-                    << ", buffer size: " << reorganized_input.size() << std::endl;
-          continue;
-        }
-        std::memcpy(
-            reorganized_input.data() + dst_row_offset,
-            im2col_output + src_row_offset,
-            valid_patches * sizeof(int8_t));
-        if (valid_patches < block_size) {
-          std::memset(
-              reorganized_input.data() + dst_row_offset + valid_patches,
-              0,
-              (block_size - valid_patches) * sizeof(int8_t));
-        }
+for (int64_t b = 0; b < batch_size; b++) {
+  for (int64_t j = 0; j < J; j++) {
+    size_t block_offset = (b * J + j) * block_data_size;
+    int64_t valid_patches = std::min(block_size, patches_per_image - j * block_size);
+    for (int64_t k = 0; k < K; k++) {
+      size_t dst_row_offset = block_offset + k * block_size;
+      size_t src_row_offset = b * K * patches_per_image + k * patches_per_image + j * block_size;
+      if (src_row_offset + valid_patches > static_cast<size_t>(batch_size * K * patches_per_image) ||
+          dst_row_offset + valid_patches > reorganized_input.size()) {
+        std::cerr << "  ERROR: Invalid indices during input reorganization:" << std::endl;
+        std::cerr << "    src_row_offset: " << src_row_offset
+                  << ", dst_row_offset: " << dst_row_offset
+                  << ", valid_patches: " << valid_patches
+                  << ", input size: " << batch_size * K * patches_per_image
+                  << ", buffer size: " << reorganized_input.size() << std::endl;
+        continue;
+      }
+      std::memcpy(
+          reorganized_input.data() + dst_row_offset,
+          im2col_output + src_row_offset,
+          valid_patches * sizeof(int8_t));
+      if (valid_patches < block_size) {
+        std::memset(
+            reorganized_input.data() + dst_row_offset + valid_patches,
+            0,
+            (block_size - valid_patches) * sizeof(int8_t));
       }
     }
   }
+}
 
-  // Lancio un thread separato per la lettura dei risultati in parallelo
-  std::thread receiver_thread;
-  std::vector<int8_t> result_data;
-  std::mutex result_mutex;
-  std::condition_variable result_cv;
-  bool reading_complete = false;
-
-  receiver_thread = std::thread([&]() {
-    int64_t received_batch;
-    if (read(device_to_host_fd[0], &received_batch, sizeof(received_batch)) != sizeof(received_batch)) {
-      std::cerr << "Error: failed to read batch index from results" << std::endl;
-      should_stop.store(true);
-      return;
-    }
-
-    uint32_t result_size;
-    if (read(device_to_host_fd[0], &result_size, sizeof(result_size)) != sizeof(result_size)) {
-      std::cerr << "Error: failed to read result size" << std::endl;
-      should_stop.store(true);
-      return;
-    }
-    size_t expected_size = static_cast<size_t>(J * batch_size * oc_blocks * block_size * block_size);
-    if (result_size != expected_size) {
-      std::cerr << "Warning: Received result size (" << result_size
-                << ") differs from expected size (" << expected_size << ")" << std::endl;
-    }
-
-    {
-      std::lock_guard<std::mutex> lock(result_mutex);
-      result_data.resize(result_size);
-    }
-
-    size_t bytes_read = 0;
-    while (bytes_read < result_size && !should_stop.load()) {
-      ssize_t result = read(device_to_host_fd[0],
-                            result_data.data() + bytes_read,
-                            result_size - bytes_read);
-
-      if (result <= 0) {
-        std::cerr << "Error: failed to read result data. Read " << bytes_read
-                  << " of " << result_size << " bytes. Errno: " << errno
-                  << " (" << strerror(errno) << ")" << std::endl;
-        should_stop.store(true);
-        return;
-      }
-
-      bytes_read += result;
-    }
-
-    {
-      std::lock_guard<std::mutex> lock(result_mutex);
-      reading_complete = true;
-      result_cv.notify_one();
-    }
-  });
-
-  // Thread principale continua con l'invio dei dati
-  if (write(host_to_device_fd[1], &header, sizeof(header)) != sizeof(header)) {
-    std::cerr << "Error: failed to write header to accelerator" << std::endl;
-    should_stop.store(true);
-    if (receiver_thread.joinable()) {
-      receiver_thread.join();
-    }
-    close(host_to_device_fd[0]);
-    close(host_to_device_fd[1]);
-    close(device_to_host_fd[0]);
-    close(device_to_host_fd[1]);
-    accel_sim.shutdown();
-    return;
-  }
-
-  int64_t all_batches = 0;  // Marker that we're sending all batches
-  if (write(host_to_device_fd[1], &all_batches, sizeof(all_batches)) != sizeof(all_batches)) {
-    std::cerr << "Error: failed to write batch index to accelerator" << std::endl;
-    should_stop.store(true);
-    if (receiver_thread.joinable()) {
-      receiver_thread.join();
-    }
-    close(host_to_device_fd[0]);
-    close(host_to_device_fd[1]);
-    close(device_to_host_fd[0]);
-    close(device_to_host_fd[1]);
-    accel_sim.shutdown();
-    return;
-  }
-
-  uint32_t data_size = static_cast<uint32_t>(reorganized_input.size());
-  if (write(host_to_device_fd[1], &data_size, sizeof(data_size)) != sizeof(data_size)) {
-    std::cerr << "Error: failed to write data size to accelerator" << std::endl;
-    should_stop.store(true);
-    if (receiver_thread.joinable()) {
-      receiver_thread.join();
-    }
-    close(host_to_device_fd[0]);
-    close(host_to_device_fd[1]);
-    close(device_to_host_fd[0]);
-    close(device_to_host_fd[1]);
-    accel_sim.shutdown();
-    return;
-  }
-
-  // Invio chunked dei dati per evitare problemi di buffer overflow
-  size_t bytes_written = 0;
-  while (bytes_written < data_size && !should_stop.load()) {
-    size_t chunk_size = std::min(static_cast<size_t>(65536), data_size - bytes_written);
-    ssize_t result = write(host_to_device_fd[1],
-                           reorganized_input.data() + bytes_written,
-                           chunk_size);
-
-    if (result <= 0) {
-      std::cerr << "Error: failed to write data chunk. Wrote " << bytes_written
-                << " of " << data_size << " bytes. Errno: " << errno
-                << " (" << strerror(errno) << ")" << std::endl;
-      should_stop.store(true);
+auto receiver_thread = std::thread([&]() {
+  int64_t received_batch;
+  ssize_t read_result = 0;
+  int read_attempts = 0;
+  const int max_read_attempts = 100;
+  
+  while (read_attempts < max_read_attempts && !should_stop.load()) {
+    read_result = read(device_read_fd, &received_batch, sizeof(received_batch));
+    
+    if (read_result == sizeof(received_batch)) {
       break;
     }
-
-    bytes_written += result;
-  }
-
-  if (bytes_written != data_size && !should_stop.load()) {
-    std::cerr << "Error: incomplete data write: " << bytes_written << " of " << data_size << " bytes" << std::endl;
-    should_stop.store(true);
-    if (receiver_thread.joinable()) {
-      receiver_thread.join();
+    
+    if (read_result < 0) {
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        read_attempts++;
+        continue;
+      }
+      
+      std::cerr << "Error: failed to read batch index from results. Errno: " 
+                << errno << " (" << strerror(errno) << ")" << std::endl;
+      should_stop.store(true);
+      return;
     }
-    close(host_to_device_fd[0]);
-    close(host_to_device_fd[1]);
-    close(device_to_host_fd[0]);
-    close(device_to_host_fd[1]);
-    accel_sim.shutdown();
+    
+    std::cerr << "Error: incomplete read of batch index. Read " << read_result 
+              << " of " << sizeof(received_batch) << " bytes." << std::endl;
+    read_attempts++;
+  }
+  
+  if (read_attempts >= max_read_attempts) {
+    std::cerr << "Error: timeout waiting for batch index from accelerator" << std::endl;
+    should_stop.store(true);
     return;
   }
 
-  // Invio degli indirizzi di pesi e bias
-  if (write(host_to_device_fd[1], &weights_ddr3_address, sizeof(weights_ddr3_address)) != sizeof(weights_ddr3_address) ||
-      write(host_to_device_fd[1], &bias_ddr3_address, sizeof(bias_ddr3_address)) != sizeof(bias_ddr3_address)) {
-    std::cerr << "Error: failed to write addresses to accelerator" << std::endl;
+  uint32_t result_size;
+  read_result = read(device_read_fd, &result_size, sizeof(result_size));
+  
+  if (read_result != sizeof(result_size)) {
+    std::cerr << "Error: failed to read result size. Read " << read_result 
+              << " of " << sizeof(result_size) << " bytes. Errno: " 
+              << errno << " (" << strerror(errno) << ")" << std::endl;
     should_stop.store(true);
-    if (receiver_thread.joinable()) {
-      receiver_thread.join();
+    return;
+  }
+  
+  size_t expected_size = static_cast<size_t>(J * batch_size * oc_blocks * block_size * block_size);
+  if (result_size != expected_size) {
+    std::cerr << "Warning: Received result size (" << result_size
+              << ") differs from expected size (" << expected_size << ")" << std::endl;
+  }
+
+  std::vector<int8_t> result_data(result_size);
+  
+  ssize_t bytes_read = 0;
+  size_t total_bytes_read = 0;
+  
+  while (total_bytes_read < result_size && !should_stop.load()) {
+    bytes_read = read(device_read_fd,
+                      result_data.data() + total_bytes_read,
+                      result_size - total_bytes_read);
+
+    if (bytes_read <= 0) {
+      if (bytes_read < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        continue;
+      }
+      
+      std::cerr << "Error: failed to read result data. Read " << total_bytes_read
+                << " of " << result_size << " bytes. Errno: " << errno
+                << " (" << strerror(errno) << ")" << std::endl;
+      should_stop.store(true);
+      return;
     }
-    close(host_to_device_fd[0]);
-    close(host_to_device_fd[1]);
-    close(device_to_host_fd[0]);
-    close(device_to_host_fd[1]);
-    accel_sim.shutdown();
+
+    total_bytes_read += bytes_read;
+    
+    if (debug_mode && total_bytes_read % (1024 * 1024) == 0) {
+      std::cout << "  DEBUG: Read progress: " << total_bytes_read << "/" << result_size << " bytes" << std::endl;
+    }
+  }
+  
+  if (total_bytes_read != result_size) {
+    std::cerr << "Error: incomplete read of result data. Read " << total_bytes_read
+              << " of " << result_size << " bytes" << std::endl;
+    should_stop.store(true);
     return;
   }
 
-  // Invio del flag fused_relu
-  if (write(host_to_device_fd[1], &fused_relu, sizeof(fused_relu)) != sizeof(fused_relu)) {
-    std::cerr << "Error: failed to write fused_relu flag to accelerator" << std::endl;
-    should_stop.store(true);
-    if (receiver_thread.joinable()) {
-      receiver_thread.join();
-    }
-    close(host_to_device_fd[0]);
-    close(host_to_device_fd[1]);
-    close(device_to_host_fd[0]);
-    close(device_to_host_fd[1]);
-    accel_sim.shutdown();
-    return;
+  if (debug_mode) {
+    std::cout << "  DEBUG: Successfully read " << total_bytes_read << " bytes from accelerator" << std::endl;
   }
 
-  fsync(host_to_device_fd[1]);
-
-  // Libero i dati di input che non servono più
-  std::vector<int8_t>().swap(reorganized_input);
-
-  // Aspetto che il thread di lettura completi
   {
-    std::unique_lock<std::mutex> lock(result_mutex);
-    result_cv.wait(lock, [&reading_complete]() { return reading_complete; });
-  }
-
-  // Adesso che la lettura è completata, elaboro i risultati
-  if (!should_stop.load()) {
+    std::lock_guard<std::mutex> lock(output_mutex);
+    
     std::memset(output, 0, batch_size * patches_per_image * OC * sizeof(int8_t));
-    int64_t max_blocks = result_data.size() / (oc_blocks * block_size * block_size);
+    int64_t max_blocks = result_size / (oc_blocks * block_size * block_size);
 
     for (int64_t b = 0; b < batch_size; b++) {
       for (int64_t j = 0; j < J; j++) {
@@ -1103,18 +1013,18 @@ void gemm_with_accelerator(
 
         int64_t block_idx = b * J + j;
         if (block_idx >= max_blocks) {
-          std::cout << "  Warning: Skipping out-of-bounds block: " << block_idx
+          std::cerr << "  WARNING: Skipping block out of bounds: " << block_idx
                     << " (max: " << max_blocks << ")" << std::endl;
           continue;
         }
-
+        
         for (int64_t ocb = 0; ocb < oc_blocks; ocb++) {
           int64_t oc_base = ocb * block_size;
           int64_t valid_oc = std::min(block_size, OC - oc_base);
 
           size_t block_offset = (block_idx * oc_blocks + ocb) * block_size * block_size;
           if (block_offset + block_size * block_size > result_data.size()) {
-            std::cout << "  Warning: Skipping out-of-bounds block offset: " << block_offset
+            std::cerr << "  WARNING: Skipping block offset out of bounds: " << block_offset
                       << " (max: " << result_data.size() << ")" << std::endl;
             continue;
           }
@@ -1132,19 +1042,123 @@ void gemm_with_accelerator(
       }
     }
   }
+  
+  packets_received++;
+  
+  if (debug_mode) {
+    std::cout << "  DEBUG: Output reorganization complete" << std::endl;
+  }
+});
 
-  if (receiver_thread.joinable()) {
-    receiver_thread.join();
+auto sender_thread = std::thread([&]() {
+  if (write(device_write_fd, &header, sizeof(header)) != sizeof(header)) {
+    std::cerr << "Error: failed to write header to accelerator. Errno: " 
+              << errno << " (" << strerror(errno) << ")" << std::endl;
+    should_stop.store(true);
+    return;
   }
 
-  accel_sim.shutdown();
-  close(host_to_device_fd[0]);
-  close(host_to_device_fd[1]);
-  close(device_to_host_fd[0]);
-  close(device_to_host_fd[1]);
+  int64_t all_batches = 0;
+  if (write(device_write_fd, &all_batches, sizeof(all_batches)) != sizeof(all_batches)) {
+    std::cerr << "Error: failed to write batch index to accelerator. Errno: " 
+              << errno << " (" << strerror(errno) << ")" << std::endl;
+    should_stop.store(true);
+    return;
+  }
 
-  auto end_time = std::chrono::high_resolution_clock::now();
-  auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
+  uint32_t data_size = static_cast<uint32_t>(reorganized_input.size());
+  if (write(device_write_fd, &data_size, sizeof(data_size)) != sizeof(data_size)) {
+    std::cerr << "Error: failed to write data size to accelerator. Errno: " 
+              << errno << " (" << strerror(errno) << ")" << std::endl;
+    should_stop.store(true);
+    return;
+  }
+
+  ssize_t bytes_written = 0;
+  size_t total_bytes_written = 0;
+  int write_attempts = 0;
+  const int max_write_attempts = 100;
+  
+  while (total_bytes_written < data_size && write_attempts < max_write_attempts && !should_stop.load()) {
+    bytes_written = write(device_write_fd, 
+                         reorganized_input.data() + total_bytes_written,
+                         data_size - total_bytes_written);
+
+    if (bytes_written <= 0) {
+      if (bytes_written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        write_attempts++;
+        continue;
+      }
+      
+      std::cerr << "Error: failed to write data to accelerator. Wrote " << total_bytes_written
+                << " of " << data_size << " bytes. Errno: " << errno
+                << " (" << strerror(errno) << ")" << std::endl;
+      should_stop.store(true);
+      return;
+    }
+
+    total_bytes_written += bytes_written;
+    
+    if (debug_mode && total_bytes_written % (1024 * 1024) == 0) {
+      std::cout << "  DEBUG: Write progress: " << total_bytes_written << "/" << data_size << " bytes" << std::endl;
+    }
+  }
+
+  if (total_bytes_written != data_size) {
+    std::cerr << "Error: incomplete data write: " << total_bytes_written << " of " << data_size 
+              << " bytes after " << write_attempts << " attempts" << std::endl;
+    should_stop.store(true);
+    return;
+  }
+
+  if (debug_mode) {
+    std::cout << "  DEBUG: Successfully sent " << total_bytes_written << " bytes to accelerator" << std::endl;
+  }
+
+  fsync(device_write_fd);
+  packets_sent++;
+});
+
+const int max_wait_time_ms = 30000;
+int wait_time_ms = 0;
+const int check_interval_ms = 100;
+
+while (wait_time_ms < max_wait_time_ms) {
+  if (packets_received.load() > 0 && packets_sent.load() > 0) {
+    break;
+  }
+  
+  if (should_stop.load()) {
+    break;
+  }
+  
+  std::this_thread::sleep_for(std::chrono::milliseconds(check_interval_ms));
+  wait_time_ms += check_interval_ms;
+}
+
+if (wait_time_ms >= max_wait_time_ms) {
+  std::cerr << "Warning: timeout waiting for send/receive operations to complete" << std::endl;
+  should_stop.store(true);
+}
+
+if (sender_thread.joinable()) {
+  sender_thread.join();
+}
+
+if (receiver_thread.joinable()) {
+  receiver_thread.join();
+}
+
+close(device_write_fd);
+close(device_read_fd);
+
+auto end_time = std::chrono::high_resolution_clock::now();
+auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
+
+if (debug_mode) {
+  std::cout << "  DEBUG: GEMM with accelerator completed in " << duration.count() << " microseconds" << std::endl;
+}
 }
 
 Status ComputeNudgeVConvWithAccelerator(ConvQuantParams* conv_params, OrtKernelContext* context) {
@@ -1266,12 +1280,8 @@ Status ComputeNudgeVConvWithAccelerator(ConvQuantParams* conv_params, OrtKernelC
       conv_params->M_fixed,
       conv_params->output_zp,
       conv_params->input_zp,
-      conv_params->weight_zp,
-      conv_params->weights_ddr3_address,
-      conv_params->bias_ddr3_address,
       conv_params->k_blocks,
       conv_params->oc_blocks,
-      conv_params->fused_relu,
       tp);
 
   auto gemm_end = std::chrono::high_resolution_clock::now();
