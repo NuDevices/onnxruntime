@@ -509,7 +509,7 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
       int64_t k_blocks = (K + block_size - 1) / block_size;
       int64_t oc_blocks = (OC + block_size - 1) / block_size;
     
-      int weights_bias_fd = open("/dev/xdma0_bypass", O_RDWR);
+      int weights_bias_fd = open("/dev/xdma0_bypass", O_RDWR | O_SYNC);
       if (weights_bias_fd == -1) {
           std::cerr << "Error: failed to open /dev/xdma0_bypass, errno=" << errno << std::endl;
           return result;
@@ -543,23 +543,26 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
         }
       }
 
-      void* weights_mapped_memory = mmap(nullptr, weights_size, PROT_READ | PROT_WRITE, MAP_SHARED, weights_bias_fd, 0);
+      size_t page_size = sysconf(_SC_PAGESIZE);
+      void* weights_mapped_memory = mmap(nullptr, weights_size, 
+                                        PROT_READ | PROT_WRITE, 
+                                        MAP_SHARED, weights_bias_fd, 0);
       if (weights_mapped_memory == MAP_FAILED) {
-      std::cerr << "Error: failed to mmap weights, errno=" << errno << std::endl;
-      close(weights_bias_fd);
-      return result;
+          std::cerr << "Error: failed to mmap weights, errno=" << errno 
+                    << " (" << strerror(errno) << ")" << std::endl;
+          close(weights_bias_fd);
+          return result;
       }
       std::memcpy(weights_mapped_memory, blocked_weights.data(), weights_size);
       if (msync(weights_mapped_memory, weights_size, MS_SYNC) != 0) {
-      std::cerr << "Error: msync failed for weights, errno=" << errno << std::endl;
-      munmap(weights_mapped_memory, weights_size);
-      close(weights_bias_fd);
-      return result;
+          std::cerr << "Error: msync failed for weights, errno=" << errno << std::endl;
+          munmap(weights_mapped_memory, weights_size);
+          close(weights_bias_fd);
+          return result;
       }
-
+      
       params.weights_mapped_memory = weights_mapped_memory;
       params.weights_mapped_size = weights_size;
-
 
       if (params.has_bias) {
         std::vector<int32_t> bias_blocks(oc_blocks * block_size, 0);
@@ -571,7 +574,6 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
                 }
             }
         }
-        
         size_t bias_size = oc_blocks * block_size * sizeof(int32_t);
         void* bias_mapped_memory = mmap(nullptr, bias_size, PROT_READ | PROT_WRITE, 
                                         MAP_SHARED, weights_bias_fd, params.BIAS_OFFSET);
@@ -581,9 +583,7 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
             close(weights_bias_fd);
             return result;
         }
-        
         std::memcpy(bias_mapped_memory, bias_blocks.data(), bias_size);
-        
         if (msync(bias_mapped_memory, bias_size, MS_SYNC) != 0) {
             std::cerr << "Error: msync failed for bias, errno=" << errno << std::endl;
             munmap(bias_mapped_memory, bias_size);
