@@ -10,6 +10,9 @@
 #include <immintrin.h>
 #include <vector>
 #include <string>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <fcntl.h>
 
 namespace onnxruntime {
 
@@ -137,19 +140,19 @@ struct alignas(32) ConvQuantParams {
 
     return Status::OK();
   }
-  ~ConvQuantParams() {
+~ConvQuantParams() {
     if (weights_mapped_memory != nullptr) {
-        munmap(weights_mapped_memory, weights_mapped_size);
+        ::munmap(weights_mapped_memory, weights_mapped_size);
         weights_mapped_memory = nullptr;
     }
     
     if (bias_mapped_memory != nullptr) {
-        munmap(bias_mapped_memory, bias_mapped_size);
+        ::munmap(bias_mapped_memory, bias_mapped_size);
         bias_mapped_memory = nullptr;
     }
     
     if (weights_bias_fd >= 0) {
-        close(weights_bias_fd);
+        ::close(weights_bias_fd);
         weights_bias_fd = -1;
     }
 }
