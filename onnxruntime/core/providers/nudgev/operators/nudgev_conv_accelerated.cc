@@ -839,12 +839,12 @@ const bool debug_mode = false;
 
 auto start_time = std::chrono::high_resolution_clock::now();
 
-int device_write_fd = open("/dev/xdma_h2c_0", O_WRONLY);
+int device_write_fd = open("/dev/xdma0_h2c_0", O_WRONLY);
 int device_read_fd = open("/dev/xdma0_c2h_0", O_RDONLY);
 
 if (device_write_fd < 0 || device_read_fd < 0) {
-  std::cerr << "Error: failed to open accelerator device files. Write FD: " 
-            << device_write_fd << ", Read FD: " << device_read_fd 
+  std::cerr << "Error: failed to open accelerator device files. Write FD: "
+            << device_write_fd << ", Read FD: " << device_read_fd
             << ", errno: " << errno << " (" << strerror(errno) << ")" << std::endl;
   return;
 }
@@ -909,32 +909,32 @@ auto receiver_thread = std::thread([&]() {
   ssize_t read_result = 0;
   int read_attempts = 0;
   const int max_read_attempts = 100;
-  
+
   while (read_attempts < max_read_attempts && !should_stop.load()) {
     read_result = read(device_read_fd, &received_batch, sizeof(received_batch));
-    
+
     if (read_result == sizeof(received_batch)) {
       break;
     }
-    
+
     if (read_result < 0) {
       if (errno == EAGAIN || errno == EWOULDBLOCK) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
         read_attempts++;
         continue;
       }
-      
-      std::cerr << "Error: failed to read batch index from results. Errno: " 
+
+      std::cerr << "Error: failed to read batch index from results. Errno: "
                 << errno << " (" << strerror(errno) << ")" << std::endl;
       should_stop.store(true);
       return;
     }
-    
-    std::cerr << "Error: incomplete read of batch index. Read " << read_result 
+
+    std::cerr << "Error: incomplete read of batch index. Read " << read_result
               << " of " << sizeof(received_batch) << " bytes." << std::endl;
     read_attempts++;
   }
-  
+
   if (read_attempts >= max_read_attempts) {
     std::cerr << "Error: timeout waiting for batch index from accelerator" << std::endl;
     should_stop.store(true);
@@ -943,15 +943,15 @@ auto receiver_thread = std::thread([&]() {
 
   uint32_t result_size;
   read_result = read(device_read_fd, &result_size, sizeof(result_size));
-  
+
   if (read_result != sizeof(result_size)) {
-    std::cerr << "Error: failed to read result size. Read " << read_result 
-              << " of " << sizeof(result_size) << " bytes. Errno: " 
+    std::cerr << "Error: failed to read result size. Read " << read_result
+              << " of " << sizeof(result_size) << " bytes. Errno: "
               << errno << " (" << strerror(errno) << ")" << std::endl;
     should_stop.store(true);
     return;
   }
-  
+
   size_t expected_size = static_cast<size_t>(J * batch_size * oc_blocks * block_size * block_size);
   if (result_size != expected_size) {
     std::cerr << "Warning: Received result size (" << result_size
@@ -959,10 +959,10 @@ auto receiver_thread = std::thread([&]() {
   }
 
   std::vector<int8_t> result_data(result_size);
-  
+
   ssize_t bytes_read = 0;
   size_t total_bytes_read = 0;
-  
+
   while (total_bytes_read < result_size && !should_stop.load()) {
     bytes_read = read(device_read_fd,
                       result_data.data() + total_bytes_read,
@@ -973,7 +973,7 @@ auto receiver_thread = std::thread([&]() {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
         continue;
       }
-      
+
       std::cerr << "Error: failed to read result data. Read " << total_bytes_read
                 << " of " << result_size << " bytes. Errno: " << errno
                 << " (" << strerror(errno) << ")" << std::endl;
@@ -982,12 +982,12 @@ auto receiver_thread = std::thread([&]() {
     }
 
     total_bytes_read += bytes_read;
-    
+
     if (debug_mode && total_bytes_read % (1024 * 1024) == 0) {
       std::cout << "  DEBUG: Read progress: " << total_bytes_read << "/" << result_size << " bytes" << std::endl;
     }
   }
-  
+
   if (total_bytes_read != result_size) {
     std::cerr << "Error: incomplete read of result data. Read " << total_bytes_read
               << " of " << result_size << " bytes" << std::endl;
@@ -1001,7 +1001,7 @@ auto receiver_thread = std::thread([&]() {
 
   {
     std::lock_guard<std::mutex> lock(output_mutex);
-    
+
     std::memset(output, 0, batch_size * patches_per_image * OC * sizeof(int8_t));
     int64_t max_blocks = result_size / (oc_blocks * block_size * block_size);
 
@@ -1017,7 +1017,7 @@ auto receiver_thread = std::thread([&]() {
                     << " (max: " << max_blocks << ")" << std::endl;
           continue;
         }
-        
+
         for (int64_t ocb = 0; ocb < oc_blocks; ocb++) {
           int64_t oc_base = ocb * block_size;
           int64_t valid_oc = std::min(block_size, OC - oc_base);
@@ -1042,9 +1042,9 @@ auto receiver_thread = std::thread([&]() {
       }
     }
   }
-  
+
   packets_received++;
-  
+
   if (debug_mode) {
     std::cout << "  DEBUG: Output reorganization complete" << std::endl;
   }
@@ -1052,7 +1052,7 @@ auto receiver_thread = std::thread([&]() {
 
 auto sender_thread = std::thread([&]() {
   if (write(device_write_fd, &header, sizeof(header)) != sizeof(header)) {
-    std::cerr << "Error: failed to write header to accelerator. Errno: " 
+    std::cerr << "Error: failed to write header to accelerator. Errno: "
               << errno << " (" << strerror(errno) << ")" << std::endl;
     should_stop.store(true);
     return;
@@ -1060,7 +1060,7 @@ auto sender_thread = std::thread([&]() {
 
   int64_t all_batches = 0;
   if (write(device_write_fd, &all_batches, sizeof(all_batches)) != sizeof(all_batches)) {
-    std::cerr << "Error: failed to write batch index to accelerator. Errno: " 
+    std::cerr << "Error: failed to write batch index to accelerator. Errno: "
               << errno << " (" << strerror(errno) << ")" << std::endl;
     should_stop.store(true);
     return;
@@ -1068,7 +1068,7 @@ auto sender_thread = std::thread([&]() {
 
   uint32_t data_size = static_cast<uint32_t>(reorganized_input.size());
   if (write(device_write_fd, &data_size, sizeof(data_size)) != sizeof(data_size)) {
-    std::cerr << "Error: failed to write data size to accelerator. Errno: " 
+    std::cerr << "Error: failed to write data size to accelerator. Errno: "
               << errno << " (" << strerror(errno) << ")" << std::endl;
     should_stop.store(true);
     return;
@@ -1078,9 +1078,9 @@ auto sender_thread = std::thread([&]() {
   size_t total_bytes_written = 0;
   int write_attempts = 0;
   const int max_write_attempts = 100;
-  
+
   while (total_bytes_written < data_size && write_attempts < max_write_attempts && !should_stop.load()) {
-    bytes_written = write(device_write_fd, 
+    bytes_written = write(device_write_fd,
                          reorganized_input.data() + total_bytes_written,
                          data_size - total_bytes_written);
 
@@ -1090,7 +1090,7 @@ auto sender_thread = std::thread([&]() {
         write_attempts++;
         continue;
       }
-      
+
       std::cerr << "Error: failed to write data to accelerator. Wrote " << total_bytes_written
                 << " of " << data_size << " bytes. Errno: " << errno
                 << " (" << strerror(errno) << ")" << std::endl;
@@ -1099,14 +1099,14 @@ auto sender_thread = std::thread([&]() {
     }
 
     total_bytes_written += bytes_written;
-    
+
     if (debug_mode && total_bytes_written % (1024 * 1024) == 0) {
       std::cout << "  DEBUG: Write progress: " << total_bytes_written << "/" << data_size << " bytes" << std::endl;
     }
   }
 
   if (total_bytes_written != data_size) {
-    std::cerr << "Error: incomplete data write: " << total_bytes_written << " of " << data_size 
+    std::cerr << "Error: incomplete data write: " << total_bytes_written << " of " << data_size
               << " bytes after " << write_attempts << " attempts" << std::endl;
     should_stop.store(true);
     return;
@@ -1128,11 +1128,11 @@ while (wait_time_ms < max_wait_time_ms) {
   if (packets_received.load() > 0 && packets_sent.load() > 0) {
     break;
   }
-  
+
   if (should_stop.load()) {
     break;
   }
-  
+
   std::this_thread::sleep_for(std::chrono::milliseconds(check_interval_ms));
   wait_time_ms += check_interval_ms;
 }
