@@ -26,6 +26,7 @@
 #include <fcntl.h>    
 #include <sys/stat.h> 
 #include <errno.h>     
+#include <sys/mman.h>
 
 #include "core/providers/nudgev/mock/mock_accelerator_memory.h"
 
