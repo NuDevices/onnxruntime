@@ -572,6 +572,7 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
             }
         }
         
+        size_t bias_size = oc_blocks * block_size * sizeof(int32_t);
         void* bias_mapped_memory = mmap(nullptr, bias_size, PROT_READ | PROT_WRITE, 
                                         MAP_SHARED, weights_bias_fd, params.BIAS_OFFSET);
         if (bias_mapped_memory == MAP_FAILED) {
