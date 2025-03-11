@@ -87,8 +87,6 @@ struct alignas(32) ConvQuantParams {
   int64_t output_width{};
   int64_t batch_size{};
 
-  size_t weights_ddr3_address = 0;
-  size_t bias_ddr3_address = 0;
   int64_t k_blocks = 0;
   int64_t oc_blocks = 0;
 
@@ -100,8 +98,12 @@ struct alignas(32) ConvQuantParams {
   std::string auto_pad;
   std::string node_name;
 
-  int weights_bias_fd = -1;     
-  static constexpr size_t BIAS_OFFSET = 100 * 1024 * 1024;
+  int weights_bias_fd = -1;
+  void* weights_mapped_memory = nullptr;
+  size_t weights_mapped_size = 0;
+  void* bias_mapped_memory = nullptr;
+  size_t bias_mapped_size = 0;
+  static constexpr size_t BIAS_OFFSET = 100 * 1024 * 1024; 
 
   alignas(32) std::vector<int8_t> weights;
   alignas(32) std::vector<int32_t> bias;
@@ -135,6 +137,22 @@ struct alignas(32) ConvQuantParams {
 
     return Status::OK();
   }
+  ~ConvQuantParams() {
+    if (weights_mapped_memory != nullptr) {
+        munmap(weights_mapped_memory, weights_mapped_size);
+        weights_mapped_memory = nullptr;
+    }
+    
+    if (bias_mapped_memory != nullptr) {
+        munmap(bias_mapped_memory, bias_mapped_size);
+        bias_mapped_memory = nullptr;
+    }
+    
+    if (weights_bias_fd >= 0) {
+        close(weights_bias_fd);
+        weights_bias_fd = -1;
+    }
+}
 };
 
 class Memcpy final : public OpKernel {

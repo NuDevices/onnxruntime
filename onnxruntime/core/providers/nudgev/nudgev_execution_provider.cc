@@ -510,8 +510,8 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
     
       int weights_bias_fd = open("/dev/xdma0_bypass", O_RDWR);
       if (weights_bias_fd == -1) {
-        std::cerr << "Error: failed to open /dev/xdma0_bypass, errno=" << errno << std::endl;
-        return result;
+          std::cerr << "Error: failed to open /dev/xdma0_bypass, errno=" << errno << std::endl;
+          return result;
       }
     
       size_t weights_size = k_blocks * oc_blocks * block_size * block_size;
@@ -541,34 +541,57 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
           }
         }
       }
-      lseek(weights_bias_fd, 0, SEEK_SET);
-      ssize_t weights_written = write(weights_bias_fd, blocked_weights.data(), blocked_weights.size());
-      if (weights_written != static_cast<ssize_t>(blocked_weights.size())) {
-        std::cerr << "Error: failed to write weights to file, errno=" << errno 
-                  << ", written=" << weights_written 
-                  << ", expected=" << blocked_weights.size() << std::endl;
-        close(weights_bias_fd);
-        return result;
+
+      void* weights_mapped_memory = mmap(nullptr, weights_size, PROT_READ | PROT_WRITE, MAP_SHARED, weights_bias_fd, 0);
+      if (weights_mapped_memory == MAP_FAILED) {
+      std::cerr << "Error: failed to mmap weights, errno=" << errno << std::endl;
+      close(weights_bias_fd);
+      return result;
       }
+      std::memcpy(weights_mapped_memory, blocked_weights.data(), weights_size);
+      if (msync(weights_mapped_memory, weights_size, MS_SYNC) != 0) {
+      std::cerr << "Error: msync failed for weights, errno=" << errno << std::endl;
+      munmap(weights_mapped_memory, weights_size);
+      close(weights_bias_fd);
+      return result;
+      }
+
+      params.weights_mapped_memory = weights_mapped_memory;
+      params.weights_mapped_size = weights_size;
+
+
       if (params.has_bias) {
         std::vector<int32_t> bias_blocks(oc_blocks * block_size, 0);
         for (int64_t ocb = 0; ocb < oc_blocks; ocb++) {
-          for (int64_t oc_offset = 0; oc_offset < block_size; oc_offset++) {
-            int64_t oc_idx = ocb * block_size + oc_offset;
-            if (oc_idx < OC) {
-              bias_blocks[ocb * block_size + oc_offset] = params.bias[oc_idx];
+            for (int64_t oc_offset = 0; oc_offset < block_size; oc_offset++) {
+                int64_t oc_idx = ocb * block_size + oc_offset;
+                if (oc_idx < OC) {
+                    bias_blocks[ocb * block_size + oc_offset] = params.bias[oc_idx];
+                }
             }
-          }
         }
-        lseek(weights_bias_fd, params.BIAS_OFFSET, SEEK_SET);
-        ssize_t bias_written = write(weights_bias_fd, bias_blocks.data(), bias_blocks.size() * sizeof(int32_t));
-        if (bias_written != static_cast<ssize_t>(bias_blocks.size() * sizeof(int32_t))) {
-          std::cerr << "Error: failed to write bias to file, errno=" << errno 
-                    << ", written=" << bias_written 
-                    << ", expected=" << (bias_blocks.size() * sizeof(int32_t)) << std::endl;
-          close(weights_bias_fd);
-          return result;
+        
+        void* bias_mapped_memory = mmap(nullptr, bias_size, PROT_READ | PROT_WRITE, 
+                                        MAP_SHARED, weights_bias_fd, params.BIAS_OFFSET);
+        if (bias_mapped_memory == MAP_FAILED) {
+            std::cerr << "Error: failed to mmap bias, errno=" << errno << std::endl;
+            munmap(weights_mapped_memory, weights_size);
+            close(weights_bias_fd);
+            return result;
         }
+        
+        std::memcpy(bias_mapped_memory, bias_blocks.data(), bias_size);
+        
+        if (msync(bias_mapped_memory, bias_size, MS_SYNC) != 0) {
+            std::cerr << "Error: msync failed for bias, errno=" << errno << std::endl;
+            munmap(bias_mapped_memory, bias_size);
+            munmap(weights_mapped_memory, weights_size);
+            close(weights_bias_fd);
+            return result;
+        }
+        
+        params.bias_mapped_memory = bias_mapped_memory;
+        params.bias_mapped_size = bias_size;
       }
       params.weights_bias_fd = weights_bias_fd;
       params.k_blocks = k_blocks;
