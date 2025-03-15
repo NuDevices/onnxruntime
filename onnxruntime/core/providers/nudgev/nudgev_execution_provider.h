@@ -101,13 +101,6 @@ struct alignas(32) ConvQuantParams {
   std::string auto_pad;
   std::string node_name;
 
-  int weights_bias_fd = -1;
-  void* weights_mapped_memory = nullptr;
-  size_t weights_mapped_size = 0;
-  void* bias_mapped_memory = nullptr;
-  size_t bias_mapped_size = 0;
-  static constexpr size_t BIAS_OFFSET = 100 * 1024 * 1024; 
-
   alignas(32) std::vector<int8_t> weights;
   alignas(32) std::vector<int32_t> bias;
   alignas(32) std::vector<int8_t> im2col_buffer;
@@ -140,22 +133,6 @@ struct alignas(32) ConvQuantParams {
 
     return Status::OK();
   }
-~ConvQuantParams() {
-    if (weights_mapped_memory != nullptr) {
-        ::munmap(weights_mapped_memory, weights_mapped_size);
-        weights_mapped_memory = nullptr;
-    }
-    
-    if (bias_mapped_memory != nullptr) {
-        ::munmap(bias_mapped_memory, bias_mapped_size);
-        bias_mapped_memory = nullptr;
-    }
-    
-    if (weights_bias_fd >= 0) {
-        ::close(weights_bias_fd);
-        weights_bias_fd = -1;
-    }
-}
 };
 
 class Memcpy final : public OpKernel {
@@ -226,6 +203,19 @@ class NudgevExecutionProvider : public IExecutionProvider {
 
   mutable bool kernel_registry_initialized_{false};
   ModelMetadefIdGenerator metadef_id_generator_;
+
+  Status InitializeGlobalMemory() const;
+  void CleanupGlobalMemory() const;
+
+  mutable void* global_weights_mapped_memory = nullptr;
+  mutable void* global_bias_mapped_memory = nullptr;
+  mutable int global_weights_bias_fd = -1;
+  mutable size_t global_weights_offset = 0;
+  mutable size_t global_bias_offset = 0;
+  mutable size_t global_weights_mmap_size = 100 * 1024 * 1024;
+  mutable size_t global_bias_mmap_size = 50 * 1024 * 1024;
+  static constexpr size_t BIAS_MEMORY_OFFSET = 100 * 1024 * 1024;
+  mutable bool initialized_memory = false;
 };
 
 }  // namespace onnxruntime

@@ -216,17 +216,22 @@ Status NudgevExecutionProvider::ParseProviderOptions(const ProviderOptions& prov
 }
 
 NudgevExecutionProvider::NudgevExecutionProvider(
-    const ProviderOptions& provider_options_map,
-    const SessionOptions* session_options)
-    : IExecutionProvider(kNudgevExecutionProvider) {
-  if (session_options) {
-    disable_cpu_ep_fallback_ = session_options->config_options.GetConfigOrDefault(
-                                   kOrtSessionOptionsDisableCPUEPFallback, "0") == "1";
-    context_cache_enabled_ = session_options->config_options.GetConfigOrDefault(
-                                 kOrtSessionOptionEpContextEnable, "0") == "1";
-  }
+  const ProviderOptions& provider_options_map,
+  const SessionOptions* session_options)
+  : IExecutionProvider(kNudgevExecutionProvider) {
+if (session_options) {
+  disable_cpu_ep_fallback_ = session_options->config_options.GetConfigOrDefault(
+                                 kOrtSessionOptionsDisableCPUEPFallback, "0") == "1";
+  context_cache_enabled_ = session_options->config_options.GetConfigOrDefault(
+                               kOrtSessionOptionEpContextEnable, "0") == "1";
+}
 
-  ORT_ENFORCE(ParseProviderOptions(provider_options_map).IsOK());
+ORT_ENFORCE(ParseProviderOptions(provider_options_map).IsOK());
+
+Status status = InitializeGlobalMemory();
+if (!status.IsOK()) {
+  LOGS_DEFAULT(WARNING) << "Failed to initialize global memory: " << status.ErrorMessage();
+}
 }
 
 std::shared_ptr<KernelRegistry> NudgevExecutionProvider::GetKernelRegistry() const {
@@ -243,11 +248,69 @@ DataLayout NudgevExecutionProvider::GetPreferredLayout() const {
 }
 
 NudgevExecutionProvider::~NudgevExecutionProvider() {
-  for (const auto& param : saved_conv_params_) {
-    if (param->weights_bias_fd >= 0) {
-      close(param->weights_bias_fd);
-    }
+  if (initialized_memory) {
+    CleanupGlobalMemory();
   }
+}
+
+Status NudgevExecutionProvider::InitializeGlobalMemory() const {
+  if (initialized_memory) {
+    return Status::OK();
+  }
+
+  global_weights_bias_fd = open("/dev/xdma0_bypass", O_RDWR | O_SYNC);
+  if (global_weights_bias_fd == -1) {
+    return Status(common::ONNXRUNTIME, common::FAIL,
+                  "Failed to open /dev/xdma0_bypass, errno=" + std::to_string(errno));
+  }
+
+  global_weights_mapped_memory = mmap(nullptr, global_weights_mmap_size,
+                                      PROT_READ | PROT_WRITE, MAP_SHARED,
+                                      global_weights_bias_fd, 0);
+  if (global_weights_mapped_memory == MAP_FAILED) {
+    close(global_weights_bias_fd);
+    global_weights_bias_fd = -1;
+    return Status(common::ONNXRUNTIME, common::FAIL,
+                  "Failed to mmap weights, errno=" + std::to_string(errno));
+  }
+
+  global_bias_mapped_memory = mmap(nullptr, global_bias_mmap_size,
+                                   PROT_READ | PROT_WRITE, MAP_SHARED,
+                                   global_weights_bias_fd, BIAS_MEMORY_OFFSET);
+  if (global_bias_mapped_memory == MAP_FAILED) {
+    munmap(global_weights_mapped_memory, global_weights_mmap_size);
+    global_weights_mapped_memory = nullptr;
+    close(global_weights_bias_fd);
+    global_weights_bias_fd = -1;
+    return Status(common::ONNXRUNTIME, common::FAIL,
+                  "Failed to mmap bias, errno=" + std::to_string(errno));
+  }
+
+  global_weights_offset = 0;
+  global_bias_offset = 0;
+  initialized_memory = true;
+  return Status::OK();
+}
+
+void NudgevExecutionProvider::CleanupGlobalMemory() const {
+  if (global_weights_mapped_memory != nullptr) {
+    munmap(global_weights_mapped_memory, global_weights_mmap_size);
+    global_weights_mapped_memory = nullptr;
+  }
+
+  if (global_bias_mapped_memory != nullptr) {
+    munmap(global_bias_mapped_memory, global_bias_mmap_size);
+    global_bias_mapped_memory = nullptr;
+  }
+
+  if (global_weights_bias_fd >= 0) {
+    close(global_weights_bias_fd);
+    global_weights_bias_fd = -1;
+  }
+
+  global_weights_offset = 0;
+  global_bias_offset = 0;
+  initialized_memory = false;
 }
 
 std::vector<std::unique_ptr<ComputeCapability>>
@@ -363,7 +426,6 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
       params.N = effective_batch_size * params.output_height * params.output_width;
       params.K = input_channels * KH * KW;
       const size_t temp_buffer_size = params.N * OC;
-      const size_t input_size = effective_batch_size * input_channels * input_height * input_width;
       const size_t padded_input = effective_batch_size * input_channels * max_padded_height * max_padded_width;
       params.padded_buffer.resize(padded_input);
       params.temp_buffer.resize(temp_buffer_size);
@@ -509,109 +571,84 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
       int64_t k_blocks = (K + block_size - 1) / block_size;
       int64_t oc_blocks = (OC + block_size - 1) / block_size;
 
-      int weights_bias_fd = open("/dev/xdma0_bypass", O_RDWR | O_SYNC);
-      if (weights_bias_fd == -1) {
-          std::cerr << "Error: failed to open /dev/xdma0_bypass, errno=" << errno << std::endl;
+      // Inizializza la memoria globale se non è già stato fatto
+      if (!initialized_memory) {
+        Status status = InitializeGlobalMemory();
+        if (!status.IsOK()) {
+          LOGS_DEFAULT(ERROR) << "Failed to initialize global memory: " << status.ErrorMessage();
           return result;
+        }
       }
 
-      // Ensure weights_size is within the allocated mmap size
+      // Calcola la dimensione necessaria per i pesi a blocchi
       size_t weights_size = k_blocks * oc_blocks * block_size * block_size;
-      size_t mmap_size = 100 * 1024 * 1024;  // 100MB
-      if (weights_size > mmap_size) {
-          std::cerr << "Error: weights_size exceeds allocated mmap size!" << std::endl;
-          close(weights_bias_fd);
-          return result;
+
+      // Verifica che ci sia spazio sufficiente per i pesi
+      if (global_weights_offset + weights_size > global_weights_mmap_size) {
+        LOGS_DEFAULT(ERROR) << "Error: weights_size exceeds allocated mmap size! Requested: "
+                        << global_weights_offset + weights_size << ", Available: " << global_weights_mmap_size;
+        return result;
       }
 
-      // Allocate memory and prepare weights
+      // Prepara i pesi a blocchi
       std::vector<int8_t> blocked_weights(weights_size, 0);
       for (int64_t kb = 0; kb < k_blocks; kb++) {
-          for (int64_t ocb = 0; ocb < oc_blocks; ocb++) {
-              int64_t block_idx = kb * oc_blocks + ocb;
-              size_t block_offset = block_idx * block_size * block_size;
-              int64_t actual_k_size = std::min(block_size, K - kb * block_size);
-              int64_t actual_oc_size = std::min(block_size, OC - ocb * block_size);
-              for (int64_t k_offset = 0; k_offset < actual_k_size; k_offset++) {
-                  for (int64_t oc_offset = 0; oc_offset < actual_oc_size; oc_offset++) {
-                      int64_t k_idx = kb * block_size + k_offset;
-                      int64_t oc_idx = ocb * block_size + oc_offset;
-                      size_t dest_idx = block_offset + k_offset * block_size + oc_offset;
-                      blocked_weights[dest_idx] = params.weights[oc_idx * K + k_idx];
-                  }
-              }
+        for (int64_t ocb = 0; ocb < oc_blocks; ocb++) {
+          int64_t block_idx = kb * oc_blocks + ocb;
+          size_t block_offset = block_idx * block_size * block_size;
+          int64_t actual_k_size = std::min(block_size, K - kb * block_size);
+          int64_t actual_oc_size = std::min(block_size, OC - ocb * block_size);
+          for (int64_t k_offset = 0; k_offset < actual_k_size; k_offset++) {
+            for (int64_t oc_offset = 0; oc_offset < actual_oc_size; oc_offset++) {
+              int64_t k_idx = kb * block_size + k_offset;
+              int64_t oc_idx = ocb * block_size + oc_offset;
+              size_t dest_idx = block_offset + k_offset * block_size + oc_offset;
+              blocked_weights[dest_idx] = params.weights[oc_idx * K + k_idx];
+            }
           }
+        }
       }
 
-      // Map device memory
-      void* weights_mapped_memory = mmap(nullptr, mmap_size, PROT_READ | PROT_WRITE, MAP_SHARED, weights_bias_fd, 0);
-      if (weights_mapped_memory == MAP_FAILED) {
-          std::cerr << "Error: failed to mmap weights, errno=" << errno << " (" << strerror(errno) << ")" << std::endl;
-          close(weights_bias_fd);
-          return result;
-      }
+      // Copia i pesi nella memoria mappata all'offset corrente
+      void* weights_dest = static_cast<uint8_t*>(global_weights_mapped_memory) + global_weights_offset;
+      std::memcpy(weights_dest, blocked_weights.data(), weights_size);
 
-      // Copy data to mmap region
-      std::memcpy(weights_mapped_memory, blocked_weights.data(), weights_size);
-
-      // Ensure msync does not exceed page-aligned size
-      size_t page_size = sysconf(_SC_PAGESIZE);
-      // size_t weights_aligned_size = (weights_size + page_size - 1) & ~(page_size - 1);
-      // if (msync(weights_mapped_memory, weights_aligned_size, MS_SYNC) != 0) {
-      //     std::cerr << "Error: msync failed for weights, errno=" << errno << std::endl;
-      //     munmap(weights_mapped_memory, mmap_size);
-      //     close(weights_bias_fd);
-      //     return result;
-      // }
-
-      params.weights_mapped_memory = weights_mapped_memory;
-      params.weights_mapped_size = weights_size;
-
-      // Only map bias if required
+      // Prepara bias se necessario
       if (params.has_bias) {
-          size_t bias_size = oc_blocks * block_size * sizeof(int32_t);
-          if (bias_size > 50 * 1024 * 1024) {
-              std::cerr << "Error: bias size exceeds allocated mmap size!" << std::endl;
-              munmap(weights_mapped_memory, mmap_size);
-              close(weights_bias_fd);
-              return result;
+        size_t bias_size = oc_blocks * block_size * sizeof(int32_t);
+
+        // Verifica che ci sia spazio sufficiente per il bias
+        if (global_bias_offset + bias_size > global_bias_mmap_size) {
+          LOGS_DEFAULT(ERROR) << "Error: bias size exceeds allocated mmap size! Requested: "
+                          << global_bias_offset + bias_size << ", Available: " << global_bias_mmap_size;
+          return result;
+        }
+
+        // Prepara i bias a blocchi
+        std::vector<int32_t> bias_blocks(oc_blocks * block_size, 0);
+        for (int64_t ocb = 0; ocb < oc_blocks; ocb++) {
+          for (int64_t oc_offset = 0; oc_offset < block_size; oc_offset++) {
+            int64_t oc_idx = ocb * block_size + oc_offset;
+            if (oc_idx < OC) {
+              bias_blocks[ocb * block_size + oc_offset] = params.bias[oc_idx];
+            }
           }
+        }
 
-          void* bias_mapped_memory = mmap(nullptr, 50 * 1024 * 1024, PROT_READ | PROT_WRITE, MAP_SHARED, weights_bias_fd, params.BIAS_OFFSET);
-          if (bias_mapped_memory == MAP_FAILED) {
-              std::cerr << "Error: failed to mmap bias, errno=" << errno << std::endl;
-              munmap(weights_mapped_memory, mmap_size);
-              close(weights_bias_fd);
-              return result;
-          }
+        // Copia i bias nella memoria mappata all'offset corrente
+        void* bias_dest = static_cast<uint8_t*>(global_bias_mapped_memory) + global_bias_offset;
+        std::memcpy(bias_dest, bias_blocks.data(), bias_size);
 
-          std::vector<int32_t> bias_blocks(oc_blocks * block_size, 0);
-          for (int64_t ocb = 0; ocb < oc_blocks; ocb++) {
-              for (int64_t oc_offset = 0; oc_offset < block_size; oc_offset++) {
-                  int64_t oc_idx = ocb * block_size + oc_offset;
-                  if (oc_idx < OC) {
-                      bias_blocks[ocb * block_size + oc_offset] = params.bias[oc_idx];
-                  }
-              }
-          }
-
-          std::memcpy(bias_mapped_memory, bias_blocks.data(), bias_size);
-          // size_t bias_aligned_size = (bias_size + page_size - 1) & ~(page_size - 1);
-          // if (msync(bias_mapped_memory, bias_aligned_size, MS_SYNC) != 0) {
-          //     std::cerr << "Error: msync failed for bias, errno=" << errno << std::endl;
-          //     munmap(bias_mapped_memory, 50 * 1024 * 1024);
-          //     munmap(weights_mapped_memory, mmap_size);
-          //     close(weights_bias_fd);
-          //     return result;
-          // }
-
-          params.bias_mapped_memory = bias_mapped_memory;
-          params.bias_mapped_size = bias_size;
+        // Aggiorna l'offset bias per il prossimo layer
+        global_bias_offset += bias_size;
       }
 
-      params.weights_bias_fd = weights_bias_fd;
+      // Salva solo i blocchi per l'acceleratore
       params.k_blocks = k_blocks;
       params.oc_blocks = oc_blocks;
+
+      // Aggiorna l'offset per il prossimo layer di pesi
+      global_weights_offset += weights_size;
 
       std::vector<const Node*> fused_nodes{input_dq, weight_dq, node};
       if (bias_dq) {
@@ -851,6 +888,7 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
       continue;
     }
   }
+
   for (const NodeIndex node_index : order) {
     const Node* node = graph_viewer.GetNode(node_index);
 
@@ -1030,6 +1068,10 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
       handled_nodes.insert(fused_nodes.begin(), fused_nodes.end());
       continue;
     }
+  }
+  if (initialized_memory) {
+    LOGS_DEFAULT(INFO) << "Cleaning up mapped memory after graph processing";
+    CleanupGlobalMemory();
   }
   return result;
 }
