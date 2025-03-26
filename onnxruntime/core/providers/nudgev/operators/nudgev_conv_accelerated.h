@@ -14,6 +14,7 @@ void acc_im2col(const int8_t* input, int8_t** output,
                 int64_t kernel_h, int64_t kernel_w,
                 int64_t stride_h, const std::vector<int64_t>& pads,
                 int8_t* padded_buffer,
+                int8_t input_zp,
                 concurrency::ThreadPool* tp);
 
 void gemm_with_accelerator(

@@ -1336,6 +1336,7 @@ Status ComputeNudgeVConvWithAccelerator(ConvQuantParams* conv_params, OrtKernelC
       conv_params->strides[0],
       conv_params->pads,
       conv_params->padded_buffer.data(),
+      conv_params->input_zp,
       tp);
 
   auto im2col_end = std::chrono::high_resolution_clock::now();
