@@ -6,7 +6,7 @@ import os
 import time
 
 MODEL_PATH = "models/resnet50_quantized.onnx"
-IMAGE_PATH = f"images/{os.listdir('images')[10]}"
+IMAGE_PATH = f"images/ILSVRC2012_val_00002969.JPEG"
 LABELS_PATH = "labels/synset_words.txt"
 USE_NUDGEV = True
 ENABLE_PROFILE = False
