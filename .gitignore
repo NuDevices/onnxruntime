@@ -196,3 +196,5 @@ Package.resolved
 .build/
 .swiftpm/
 repros/
+
+!test_ep/model/*.onnx
