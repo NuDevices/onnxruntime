@@ -8,7 +8,7 @@
 #include "core/platform/threadpool.h"
 #include <immintrin.h>
 #include <functional>
-
+#include <omp.h>
 namespace onnxruntime {
 namespace nudgev {
 
@@ -328,7 +328,6 @@ void debug_im2col_3x3(
           });
     } else {
       std::cout << "DEBUG: sequential execution without ThreadPool" << std::endl;
-      // Resto del codice per il caso sequenziale...
     }
     return;
   }
@@ -431,7 +430,6 @@ void debug_im2col_3x3(
     }
   } else {
     std::cout << "DEBUG: sequential tiled execution" << std::endl;
-    // Resto del codice per il caso sequenziale con tiles...
   }
 
   std::cout << "DEBUG: im2col_3x3 completed" << std::endl;
@@ -594,6 +592,718 @@ void im2col_generic(
   }
 }
 
+void apply_padding(
+    const int8_t* input,
+    int8_t* padded_buffer,
+    int64_t batch_size,
+    int64_t channels,
+    int64_t height,
+    int64_t width,
+    const std::vector<int64_t>& pads,
+    int8_t input_zp,
+    onnxruntime::concurrency::ThreadPool* tp) {
+  const int64_t padded_height = height + pads[0] + pads[2];
+  const int64_t padded_width = width + pads[1] + pads[3];
+  const int64_t padded_size = batch_size * channels * padded_height * padded_width;
+  std::fill_n(padded_buffer, padded_size, input_zp);
+
+  if (tp != nullptr) {
+    const int64_t total_work_items = batch_size * channels;
+
+    onnxruntime::concurrency::ThreadPool::TrySimpleParallelFor(tp, total_work_items,
+                                                               [=](int64_t work_idx) {
+                                                                 const int64_t b = work_idx / channels;
+                                                                 const int64_t c = work_idx % channels;
+
+                                                                 const int64_t input_offset = (b * channels + c) * height * width;
+                                                                 const int64_t output_offset = (b * channels + c) * padded_height * padded_width;
+                                                                 int8_t* output_center = padded_buffer + output_offset + pads[0] * padded_width + pads[1];
+                                                                 const int8_t* input_start = input + input_offset;
+
+                                                                 for (int64_t h = 0; h < height; ++h) {
+                                                                   const int8_t* input_row = input_start + h * width;
+                                                                   int8_t* output_row = output_center + h * padded_width;
+
+                                                                   std::memcpy(output_row, input_row, width * sizeof(int8_t));
+                                                                 }
+                                                               });
+  } else {
+    for (int64_t b = 0; b < batch_size; ++b) {
+      for (int64_t c = 0; c < channels; ++c) {
+        const int64_t input_offset = (b * channels + c) * height * width;
+        const int64_t output_offset = (b * channels + c) * padded_height * padded_width;
+        int8_t* output_center = padded_buffer + output_offset + pads[0] * padded_width + pads[1];
+        const int8_t* input_start = input + input_offset;
+
+        for (int64_t h = 0; h < height; ++h) {
+          const int8_t* input_row = input_start + h * width;
+          int8_t* output_row = output_center + h * padded_width;
+
+          std::memcpy(output_row, input_row, width * sizeof(int8_t));
+        }
+      }
+    }
+  }
+}
+
+// Implementazione im2col 1x1 con padding on-the-fly per stride 1
+void im2col_1x1_stride1_with_padding_avx2(
+    const int8_t* __restrict__ input,
+    int8_t* __restrict__ output,
+    int64_t batch_size,
+    int64_t channels,
+    int64_t height,
+    int64_t width,
+    const std::vector<int64_t>& pads,
+    int8_t input_zp,
+    onnxruntime::concurrency::ThreadPool* tp = nullptr) {
+  const int kernel_h = 1;
+  const int kernel_w = 1;
+  const int kernel_size = kernel_h * kernel_w;
+  const int64_t padded_height = height + pads[0] + pads[2];
+  const int64_t padded_width = width + pads[1] + pads[3];
+  const int64_t output_h = padded_height - kernel_h + 1;  // stride = 1
+  const int64_t output_w = padded_width - kernel_w + 1;   // stride = 1
+  const int64_t patches_per_image = output_h * output_w;
+  const int64_t K = channels * kernel_size;
+
+  // Vettori per il padding utilizzati nelle istruzioni SIMD
+  __m256i pad_vector = _mm256_set1_epi8(input_zp);
+  __m128i pad_vector_128 = _mm_set1_epi8(input_zp);
+
+  // Parallelizziamo su batch e canali
+  auto process_bc = [&](std::ptrdiff_t bc_idx) {
+    const int64_t b = bc_idx / channels;
+    const int64_t c = bc_idx % channels;
+
+    // Per 1x1 kernel, abbiamo solo una posizione (kh=0, kw=0)
+    const int64_t kh = 0;
+    const int64_t kw = 0;
+    const int64_t k_index = c * kernel_size + kh * kernel_w + kw;
+    const int64_t output_k_offset = (b * K + k_index) * patches_per_image;
+    const int64_t input_offset = (b * channels + c) * height * width;
+
+    for (int64_t h = 0; h < output_h; ++h) {
+      const int64_t h_input = h + kh - pads[0];  // stride = 1
+      int8_t* output_row = output + output_k_offset + h * output_w;
+
+      if (h_input < 0 || h_input >= height) {
+        // Se la riga è fuori dai limiti, riempiamo con input_zp
+        int64_t w = 0;
+        // Utilizzo di AVX2 per riempire 32 elementi alla volta quando possibile
+        for (; w + 32 <= output_w; w += 32) {
+          _mm256_storeu_si256((__m256i*)(output_row + w), pad_vector);
+          _mm256_storeu_si256((__m256i*)(output_row + w + 16), pad_vector);
+        }
+        if (w + 16 <= output_w) {
+          _mm256_storeu_si256((__m256i*)(output_row + w), pad_vector);
+          w += 16;
+        }
+        for (; w < output_w; ++w) {
+          output_row[w] = input_zp;
+        }
+      } else {
+        const int8_t* input_row = input + input_offset + h_input * width;
+
+        // Calcolo limiti di padding orizzontale
+        const int64_t w_start = std::max<int64_t>(0, pads[1] - kw);
+        const int64_t w_end = std::min(output_w, width - kw + pads[1]);
+
+        // Padding a sinistra
+        int64_t w = 0;
+        for (; w + 32 <= w_start; w += 32) {
+          _mm256_storeu_si256((__m256i*)(output_row + w), pad_vector);
+          _mm256_storeu_si256((__m256i*)(output_row + w + 16), pad_vector);
+        }
+        if (w + 16 <= w_start) {
+          _mm256_storeu_si256((__m256i*)(output_row + w), pad_vector);
+          w += 16;
+        }
+        for (; w < w_start; ++w) {
+          output_row[w] = input_zp;
+        }
+
+        // Regione centrale con dati effettivi - possiamo usare memcpy per stride=1
+        if (w_end > w) {
+          std::memcpy(output_row + w, input_row + w - w_start, (w_end - w) * sizeof(int8_t));
+        }
+        w = w_end;
+
+        // Padding a destra
+        for (; w + 32 <= output_w; w += 32) {
+          _mm256_storeu_si256((__m256i*)(output_row + w), pad_vector);
+          _mm256_storeu_si256((__m256i*)(output_row + w + 16), pad_vector);
+        }
+        if (w + 16 <= output_w) {
+          _mm256_storeu_si256((__m256i*)(output_row + w), pad_vector);
+          w += 16;
+        }
+        for (; w < output_w; ++w) {
+          output_row[w] = input_zp;
+        }
+      }
+    }
+  };
+
+  const int64_t total_bc = batch_size * channels;
+
+  if (tp != nullptr) {
+    // Utilizziamo parallelismo sui canali
+    std::ptrdiff_t num_batches = std::min<std::ptrdiff_t>(total_bc, 16);
+    onnxruntime::concurrency::ThreadPool::TryBatchParallelFor(
+        tp, total_bc, process_bc, num_batches);
+  } else {
+    // Esecuzione sequenziale
+    for (int64_t bc_idx = 0; bc_idx < total_bc; ++bc_idx) {
+      process_bc(bc_idx);
+    }
+  }
+}
+
+// Implementazione im2col 1x1 con padding on-the-fly per stride 2
+void im2col_1x1_stride2_with_padding_avx2(
+    const int8_t* __restrict__ input,
+    int8_t* __restrict__ output,
+    int64_t batch_size,
+    int64_t channels,
+    int64_t height,
+    int64_t width,
+    const std::vector<int64_t>& pads,
+    int8_t input_zp,
+    onnxruntime::concurrency::ThreadPool* tp = nullptr) {
+  const int kernel_h = 1;
+  const int kernel_w = 1;
+  const int kernel_size = kernel_h * kernel_w;
+  const int64_t padded_height = height + pads[0] + pads[2];
+  const int64_t padded_width = width + pads[1] + pads[3];
+  const int64_t output_h = (padded_height - kernel_h) / 2 + 1;  // stride = 2
+  const int64_t output_w = (padded_width - kernel_w) / 2 + 1;   // stride = 2
+  const int64_t patches_per_image = output_h * output_w;
+  const int64_t K = channels * kernel_size;
+
+  // Vettori per il padding utilizzati nelle istruzioni SIMD
+  __m256i pad_vector = _mm256_set1_epi8(input_zp);
+  __m128i pad_vector_128 = _mm_set1_epi8(input_zp);
+
+  // Parallelizziamo su batch e canali
+  auto process_bc = [&](std::ptrdiff_t bc_idx) {
+    const int64_t b = bc_idx / channels;
+    const int64_t c = bc_idx % channels;
+
+    // Per 1x1 kernel, abbiamo solo una posizione (kh=0, kw=0)
+    const int64_t kh = 0;
+    const int64_t kw = 0;
+    const int64_t k_index = c * kernel_size + kh * kernel_w + kw;
+    const int64_t output_k_offset = (b * K + k_index) * patches_per_image;
+    const int64_t input_offset = (b * channels + c) * height * width;
+
+    for (int64_t h = 0; h < output_h; ++h) {
+      const int64_t h_input = h * 2 + kh - pads[0];  // stride = 2
+      int8_t* output_row = output + output_k_offset + h * output_w;
+
+      if (h_input < 0 || h_input >= height) {
+        // Se la riga è fuori dai limiti, riempiamo con input_zp
+        int64_t w = 0;
+        // Utilizzo di AVX2 per riempire 32 elementi alla volta quando possibile
+        for (; w + 32 <= output_w; w += 32) {
+          _mm256_storeu_si256((__m256i*)(output_row + w), pad_vector);
+          _mm256_storeu_si256((__m256i*)(output_row + w + 16), pad_vector);
+        }
+        if (w + 16 <= output_w) {
+          _mm256_storeu_si256((__m256i*)(output_row + w), pad_vector);
+          w += 16;
+        }
+        for (; w < output_w; ++w) {
+          output_row[w] = input_zp;
+        }
+      } else {
+        const int8_t* input_row = input + input_offset + h_input * width;
+
+        // Prefetching per migliorare le performance
+        if (h + 1 < output_h) {
+          const int64_t next_h_input = (h + 1) * 2 + kh - pads[0];
+          if (next_h_input >= 0 && next_h_input < height) {
+            __builtin_prefetch(input + input_offset + next_h_input * width, 0, 0);
+          }
+        }
+
+        // Calcolo limiti di padding per stride=2
+        const int64_t w_left_padding_end = std::max<int64_t>(0, (pads[1] - kw + 1) / 2);
+        const int64_t w_right_padding_start = std::min(output_w, (width + pads[1] - kw + 1) / 2);
+
+        // Padding a sinistra
+        int64_t w = 0;
+        for (; w + 16 <= w_left_padding_end; w += 16) {
+          _mm_storeu_si128((__m128i*)(output_row + w), pad_vector_128);
+        }
+        for (; w < w_left_padding_end; ++w) {
+          output_row[w] = input_zp;
+        }
+
+        // Regione centrale con dati effettivi - dobbiamo fare strided access
+        for (; w < w_right_padding_start; ++w) {
+          const int64_t w_input = w * 2 + kw - pads[1];
+          output_row[w] = (w_input >= 0 && w_input < width) ? input_row[w_input] : input_zp;
+        }
+
+        // Padding a destra
+        for (; w + 16 <= output_w; w += 16) {
+          _mm_storeu_si128((__m128i*)(output_row + w), pad_vector_128);
+        }
+        for (; w < output_w; ++w) {
+          output_row[w] = input_zp;
+        }
+      }
+    }
+  };
+
+  const int64_t total_bc = batch_size * channels;
+
+  if (tp != nullptr) {
+    // Utilizziamo parallelismo sui canali
+    std::ptrdiff_t num_batches = std::min<std::ptrdiff_t>(total_bc, 16);
+    onnxruntime::concurrency::ThreadPool::TryBatchParallelFor(
+        tp, total_bc, process_bc, num_batches);
+  } else {
+    // Esecuzione sequenziale
+    for (int64_t bc_idx = 0; bc_idx < total_bc; ++bc_idx) {
+      process_bc(bc_idx);
+    }
+  }
+}
+
+void im2col_3x3_stride1_with_padding_avx2(
+    const int8_t* __restrict__ input,
+    int8_t* __restrict__ output,
+    int64_t batch_size,
+    int64_t channels,
+    int64_t height,
+    int64_t width,
+    const std::vector<int64_t>& pads,
+    int8_t pad_value,
+    onnxruntime::concurrency::ThreadPool* tp = nullptr) {
+  // Validazione base dei parametri
+  if (input == nullptr || output == nullptr || batch_size <= 0 || channels <= 0 ||
+      height <= 0 || width <= 0 || pads.size() != 4) {
+    return;
+  }
+
+  const int kernel_h = 3;
+  const int kernel_w = 3;
+  const int kernel_size = kernel_h * kernel_w;
+  const int64_t padded_height = height + pads[0] + pads[2];
+  const int64_t padded_width = width + pads[1] + pads[3];
+  const int64_t output_h = (padded_height - kernel_h) + 1;
+  const int64_t output_w = (padded_width - kernel_w) + 1;
+  const int64_t patches_per_image = output_h * output_w;
+  const int64_t K = channels * kernel_size;
+
+  // Ripensamento completo del parallelismo: parallelizziamo per batch
+  auto process_batch = [&](int64_t b) {
+    if (b >= batch_size) return;
+
+    // Elabora ogni canale
+    for (int64_t c = 0; c < channels; ++c) {
+      const int64_t input_channel_offset = (b * channels + c) * height * width;
+
+      // Elabora ogni posizione del kernel
+      for (int64_t kh = 0; kh < kernel_h; ++kh) {
+        for (int64_t kw = 0; kw < kernel_w; ++kw) {
+          const int64_t k_index = c * kernel_size + kh * kernel_w + kw;
+          const int64_t output_k_offset = (b * K + k_index) * patches_per_image;
+
+          // Calcola una volta per tutte i limiti di padding orizzontale
+          const int64_t common_w_left_padding_end = std::max((int64_t)0, pads[1] - kw);
+          const int64_t common_input_offset_w = kw - pads[1];
+
+          // Ottimizzazione: prefetch della prossima riga
+          for (int64_t h = 0; h < output_h; ++h) {
+            const int64_t h_input = h + kh - pads[0];
+            int8_t* output_ptr = output + output_k_offset + h * output_w;
+
+            if (h_input < 0 || h_input >= height) {
+              // Intera riga è padding - usiamo un approccio ottimizzato per il padding
+              memset(output_ptr, pad_value, output_w);
+            } else {
+              const int8_t* input_row = input + input_channel_offset + h_input * width;
+              const int64_t w_right_padding_start = std::min(output_w, width + pads[1] - kw);
+
+              // Left padding
+              if (common_w_left_padding_end > 0) {
+                memset(output_ptr, pad_value, common_w_left_padding_end);
+              }
+
+              // Central region - memcpy quando possibile, elemento per elemento per casi limite
+              if (common_w_left_padding_end < w_right_padding_start) {
+                // Regione centrale (dato effettivo)
+                const int8_t* input_ptr = input_row + common_w_left_padding_end + common_input_offset_w;
+                const int64_t central_length = w_right_padding_start - common_w_left_padding_end;
+
+                // Verifica se gli indici sono sicuri
+                if (common_w_left_padding_end + common_input_offset_w >= 0 &&
+                    common_w_left_padding_end + common_input_offset_w + central_length <= width) {
+                  // Sicuro per memcpy - molto più veloce delle operazioni elemento per elemento
+                  memcpy(output_ptr + common_w_left_padding_end, input_ptr, central_length);
+                } else {
+                  // Non è sicuro per memcpy - copia elemento per elemento con controlli di sicurezza
+                  for (int64_t w = common_w_left_padding_end; w < w_right_padding_start; ++w) {
+                    const int64_t w_input = w + common_input_offset_w;
+                    if (w_input >= 0 && w_input < width) {
+                      output_ptr[w] = input_row[w_input];
+                    } else {
+                      output_ptr[w] = pad_value;
+                    }
+                  }
+                }
+              }
+
+              // Right padding
+              if (w_right_padding_start < output_w) {
+                memset(output_ptr + w_right_padding_start, pad_value, output_w - w_right_padding_start);
+              }
+
+              // Prefetch della prossima riga se non siamo all'ultima
+              if (h + 1 < output_h) {
+                const int64_t next_h_input = h + 1 + kh - pads[0];
+                if (next_h_input >= 0 && next_h_input < height) {
+                  const int8_t* next_input_row = input + input_channel_offset + next_h_input * width;
+                  __builtin_prefetch(next_input_row, 0, 1);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  };
+
+  // Parallelize by batch using ThreadPool or process sequentially
+  if (tp != nullptr && batch_size > 1) {
+    onnxruntime::concurrency::ThreadPool::TrySimpleParallelFor(tp, batch_size, process_batch);
+  } else {
+    for (int64_t b = 0; b < batch_size; ++b) {
+      process_batch(b);
+    }
+  }
+}
+
+void im2col_3x3_stride2_with_padding_avx2(
+    const int8_t* __restrict__ input,
+    int8_t* __restrict__ output,
+    int64_t batch_size,
+    int64_t channels,
+    int64_t height,
+    int64_t width,
+    const std::vector<int64_t>& pads,
+    int8_t pad_value,
+    onnxruntime::concurrency::ThreadPool* tp = nullptr) {
+  const int kernel_h = 3;
+  const int kernel_w = 3;
+  const int kernel_size = kernel_h * kernel_w;
+  const int64_t padded_height = height + pads[0] + pads[2];
+  const int64_t padded_width = width + pads[1] + pads[3];
+  const int64_t output_h = (padded_height - kernel_h) / 2 + 1;
+  const int64_t output_w = (padded_width - kernel_w) / 2 + 1;
+  const int64_t patches_per_image = output_h * output_w;
+  const int64_t K = channels * kernel_size;
+
+  __m256i pad_vector = _mm256_set1_epi8(pad_value);
+  __m128i pad_vector_128 = _mm_set1_epi8(pad_value);
+  // Precompute shuffle mask for stride 2
+  const __m128i shuffle_mask_128 = _mm_setr_epi8(
+      0, 2, 4, 6, 8, 10, 12, 14,
+      0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80);
+
+  auto process_kernel_position = [&](int64_t work_idx) {
+    const int64_t bckh = work_idx / kernel_w;
+    const int64_t kw = work_idx % kernel_w;
+    const int64_t bck = bckh / kernel_h;
+    const int64_t kh = bckh % kernel_h;
+    const int64_t b = bck / channels;
+    const int64_t c = bck % channels;
+
+    if (b >= batch_size || c >= channels || kh >= kernel_h || kw >= kernel_w)
+      return;
+
+    const int64_t k_index = c * kernel_size + kh * kernel_w + kw;
+    const int64_t output_k_offset = (b * K + k_index) * patches_per_image;
+    const int64_t input_offset = (b * channels + c) * height * width;
+
+    for (int64_t h = 0; h < output_h; ++h) {
+      const int64_t h_input = h * 2 + kh - pads[0];
+      int8_t* output_row = output + output_k_offset + h * output_w;
+
+      if (h_input < 0 || h_input >= height) {
+        // Vectorized padding
+        int64_t w = 0;
+        for (; w + 32 <= output_w; w += 32) {
+          _mm256_storeu_si256((__m256i*)(output_row + w), pad_vector);
+          _mm256_storeu_si256((__m256i*)(output_row + w + 16), pad_vector);
+        }
+        if (w + 16 <= output_w) {
+          _mm256_storeu_si256((__m256i*)(output_row + w), pad_vector);
+          w += 16;
+        }
+        for (; w < output_w; ++w) {
+          output_row[w] = pad_value;
+        }
+      } else {
+        const int8_t* input_row = input + input_offset + h_input * width;
+
+        if (h + 1 < output_h) {
+          const int64_t next_h_input = (h + 1) * 2 + kh - pads[0];
+          if (next_h_input >= 0 && next_h_input < height) {
+            __builtin_prefetch(input + input_offset + next_h_input * width, 0, 0);
+          }
+        }
+
+        const int64_t w_left_padding_end = std::max((int64_t)0, (pads[1] - kw + 1) / 2);
+        const int64_t w_right_padding_start = std::min(output_w, (width + pads[1] - kw + 1) / 2);
+
+        // Left padding
+        int64_t w = 0;
+        for (; w + 16 <= w_left_padding_end; w += 16) {
+          _mm_storeu_si128((__m128i*)(output_row + w), pad_vector_128);
+        }
+        for (; w < w_left_padding_end; ++w) {
+          output_row[w] = pad_value;
+        }
+
+        // Central region with vectorized stride 2 access
+        const int64_t central_start = w_left_padding_end;
+        const int64_t central_end = w_right_padding_start;
+        const int64_t central_size = central_end - central_start;
+        int64_t w_vec = 0;
+
+        for (; w_vec + 16 <= central_size; w_vec += 16) {
+          const int8_t* input_ptr = input_row + (central_start + w_vec) * 2 + kw - pads[1];
+          int8_t* output_ptr = output_row + central_start + w_vec;
+
+          __m128i in1 = _mm_loadu_si128((const __m128i*)(input_ptr));
+          __m128i in2 = _mm_loadu_si128((const __m128i*)(input_ptr + 16));
+
+          __m128i out1 = _mm_shuffle_epi8(in1, shuffle_mask_128);
+          __m128i out2 = _mm_shuffle_epi8(in2, shuffle_mask_128);
+
+          __m128i shifted_out2 = _mm_slli_si128(out2, 8);
+          __m128i combined = _mm_or_si128(out1, shifted_out2);
+
+          _mm_storeu_si128((__m128i*)output_ptr, combined);
+        }
+
+        // Remaining elements in central region
+        for (int64_t w_rem = central_start + w_vec; w_rem < central_end; ++w_rem) {
+          const int64_t w_input = w_rem * 2 + kw - pads[1];
+          output_row[w_rem] = input_row[w_input];
+        }
+
+        // Right padding
+        w = central_end;
+        for (; w + 16 <= output_w; w += 16) {
+          _mm_storeu_si128((__m128i*)(output_row + w), pad_vector_128);
+        }
+        for (; w < output_w; ++w) {
+          output_row[w] = pad_value;
+        }
+      }
+    }
+  };
+
+  const int64_t total_work = batch_size * channels * kernel_h * kernel_w;
+
+  if (tp != nullptr) {
+    onnxruntime::concurrency::ThreadPool::TrySimpleParallelFor(tp, total_work, process_kernel_position);
+  } else {
+    for (int64_t work_idx = 0; work_idx < total_work; ++work_idx) {
+      process_kernel_position(work_idx);
+    }
+  }
+}
+
+void im2col_7x7_stride1_with_padding_avx2(
+    const int8_t* __restrict__ input,
+    int8_t* __restrict__ output,
+    int64_t batch_size,
+    int64_t channels,
+    int64_t height,
+    int64_t width,
+    const std::vector<int64_t>& pads,
+    int8_t input_zp,
+    onnxruntime::concurrency::ThreadPool* tp = nullptr) {
+  const int kernel_h = 7;
+  const int kernel_w = 7;
+  const int kernel_size = kernel_h * kernel_w;
+  const int64_t padded_height = height + pads[0] + pads[2];
+  const int64_t padded_width = width + pads[1] + pads[3];
+  const int64_t output_h = padded_height - kernel_h + 1;
+  const int64_t output_w = padded_width - kernel_w + 1;
+  const int64_t patches_per_image = output_h * output_w;
+  const int64_t K = channels * kernel_size;
+
+  __m256i pad_vector = _mm256_set1_epi8(input_zp);
+  constexpr int64_t TILE_H = 32;
+  constexpr int64_t TILE_W = 32;
+
+  auto process_bc = [&](std::ptrdiff_t bc_idx) {
+    const int64_t b = bc_idx / channels;
+    const int64_t c = bc_idx % channels;
+    const int64_t input_offset = (b * channels + c) * height * width;
+
+    for (int64_t kh = 0; kh < kernel_h; ++kh) {
+      for (int64_t kw = 0; kw < kernel_w; ++kw) {
+        const int64_t k_index = c * kernel_size + kh * kernel_w + kw;
+        const int64_t output_k_offset = (b * K + k_index) * patches_per_image;
+
+        for (int64_t h_start = 0; h_start < output_h; h_start += TILE_H) {
+          const int64_t h_end = std::min(h_start + TILE_H, output_h);
+
+          for (int64_t h = h_start; h < h_end; ++h) {
+            const int64_t h_input = h + kh - pads[0];
+            int8_t* output_row = output + output_k_offset + h * output_w;
+
+            if (h_input < 0 || h_input >= height) {
+              int64_t w = 0;
+              for (; w + 32 <= output_w; w += 32) {
+                _mm256_storeu_si256((__m256i*)(output_row + w), pad_vector);
+                _mm256_storeu_si256((__m256i*)(output_row + w + 16), pad_vector);
+              }
+              if (w + 16 <= output_w) {
+                _mm256_storeu_si256((__m256i*)(output_row + w), pad_vector);
+                w += 16;
+              }
+              for (; w < output_w; ++w) {
+                output_row[w] = input_zp;
+              }
+            } else {
+              const int8_t* input_row = input + input_offset + h_input * width;
+
+              if (h + 1 < h_end) {
+                const int64_t next_h_input = (h + 1) + kh - pads[0];
+                if (next_h_input >= 0 && next_h_input < height) {
+                  __builtin_prefetch(input + input_offset + next_h_input * width, 0, 0);
+                }
+              }
+
+              for (int64_t w_start = 0; w_start < output_w; w_start += TILE_W) {
+                const int64_t w_end = std::min(w_start + TILE_W, output_w);
+
+                for (int64_t w = w_start; w < w_end; ++w) {
+                  const int64_t w_input = w + kw - pads[1];
+                  output_row[w] = (w_input >= 0 && w_input < width) ? input_row[w_input] : input_zp;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  };
+
+  const int64_t total_bc = batch_size * channels;
+
+  if (tp != nullptr) {
+    std::ptrdiff_t num_batches = std::min<std::ptrdiff_t>(total_bc, 16);
+    onnxruntime::concurrency::ThreadPool::TryBatchParallelFor(
+        tp, total_bc, process_bc, num_batches);
+  } else {
+    for (int64_t bc_idx = 0; bc_idx < total_bc; ++bc_idx) {
+      process_bc(bc_idx);
+    }
+  }
+}
+
+void im2col_7x7_stride2_with_padding_avx2(
+    const int8_t* __restrict__ input,
+    int8_t* __restrict__ output,
+    int64_t batch_size,
+    int64_t channels,
+    int64_t height,
+    int64_t width,
+    const std::vector<int64_t>& pads,
+    int8_t input_zp,
+    onnxruntime::concurrency::ThreadPool* tp = nullptr) {
+  const int kernel_h = 7;
+  const int kernel_w = 7;
+  const int kernel_size = kernel_h * kernel_w;
+  const int64_t padded_height = height + pads[0] + pads[2];
+  const int64_t padded_width = width + pads[1] + pads[3];
+  const int64_t output_h = (padded_height - kernel_h) / 2 + 1;
+  const int64_t output_w = (padded_width - kernel_w) / 2 + 1;
+  const int64_t patches_per_image = output_h * output_w;
+  const int64_t K = channels * kernel_size;
+
+  __m256i pad_vector = _mm256_set1_epi8(input_zp);
+  constexpr int64_t TILE_H = 32;
+  constexpr int64_t TILE_W = 32;
+
+  auto process_bc = [&](std::ptrdiff_t bc_idx) {
+    const int64_t b = bc_idx / channels;
+    const int64_t c = bc_idx % channels;
+    const int64_t input_offset = (b * channels + c) * height * width;
+
+    for (int64_t kh = 0; kh < kernel_h; ++kh) {
+      for (int64_t kw = 0; kw < kernel_w; ++kw) {
+        const int64_t k_index = c * kernel_size + kh * kernel_w + kw;
+        const int64_t output_k_offset = (b * K + k_index) * patches_per_image;
+
+        for (int64_t h_start = 0; h_start < output_h; h_start += TILE_H) {
+          const int64_t h_end = std::min(h_start + TILE_H, output_h);
+
+          for (int64_t h = h_start; h < h_end; ++h) {
+            const int64_t h_input = h * 2 + kh - pads[0];
+            int8_t* output_row = output + output_k_offset + h * output_w;
+
+            if (h_input < 0 || h_input >= height) {
+              int64_t w = 0;
+              for (; w + 32 <= output_w; w += 32) {
+                _mm256_storeu_si256((__m256i*)(output_row + w), pad_vector);
+                _mm256_storeu_si256((__m256i*)(output_row + w + 16), pad_vector);
+              }
+              if (w + 16 <= output_w) {
+                _mm256_storeu_si256((__m256i*)(output_row + w), pad_vector);
+                w += 16;
+              }
+              for (; w < output_w; ++w) {
+                output_row[w] = input_zp;
+              }
+            } else {
+              const int8_t* input_row = input + input_offset + h_input * width;
+
+              if (h + 1 < h_end) {
+                const int64_t next_h_input = (h + 1) * 2 + kh - pads[0];
+                if (next_h_input >= 0 && next_h_input < height) {
+                  __builtin_prefetch(input + input_offset + next_h_input * width, 0, 0);
+                }
+              }
+
+              for (int64_t w_start = 0; w_start < output_w; w_start += TILE_W) {
+                const int64_t w_end = std::min(w_start + TILE_W, output_w);
+
+                for (int64_t w = w_start; w < w_end; ++w) {
+                  const int64_t w_input = w * 2 + kw - pads[1];
+                  output_row[w] = (w_input >= 0 && w_input < width) ? input_row[w_input] : input_zp;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  };
+
+  const int64_t total_bc = batch_size * channels;
+
+  if (tp != nullptr) {
+    std::ptrdiff_t num_batches = std::min<std::ptrdiff_t>(total_bc, 16);
+    onnxruntime::concurrency::ThreadPool::TryBatchParallelFor(
+        tp, total_bc, process_bc, num_batches);
+  } else {
+    for (int64_t bc_idx = 0; bc_idx < total_bc; ++bc_idx) {
+      process_bc(bc_idx);
+    }
+  }
+}
+
 void im2col(
     const int8_t* input,
     int8_t** output,
@@ -606,6 +1316,7 @@ void im2col(
     int64_t stride_h,
     const std::vector<int64_t>& pads,
     int8_t* padded_buffer,
+    int8_t input_zp,
     onnxruntime::concurrency::ThreadPool* tp) {
   auto start = std::chrono::high_resolution_clock::now();
 
@@ -614,51 +1325,128 @@ void im2col(
     *output = const_cast<int8_t*>(input);
     return;
   }
+  /*
+  if (kernel_h == 1 && kernel_w == 1) {
+    if (stride_h == 1) {
+      std::cout << "Im2col kernel 1 stride 1 " << std::endl;
+      im2col_1x1_stride1_with_padding_avx2(
+          input,
+          *output,
+          batch_size,
+          channels,
+          height,
+          width,
+          pads,
+          input_zp,
+          tp);
 
+      auto end_im2col = std::chrono::high_resolution_clock::now();
+      auto duration_im2col = std::chrono::duration_cast<std::chrono::microseconds>(end_im2col - start);
+      return;
+    } else if (stride_h == 2) {
+      std::cout << "Im2col kernel 1 stride 2 " << std::endl;
+      im2col_1x1_stride2_with_padding_avx2(
+          input,
+          *output,
+          batch_size,
+          channels,
+          height,
+          width,
+          pads,
+          input_zp,
+          tp);
+      auto end_im2col = std::chrono::high_resolution_clock::now();
+      auto duration_im2col = std::chrono::duration_cast<std::chrono::microseconds>(end_im2col - start);
+      // std::cout << "Conv Op - Im2col 3x3 stride 2 execution time: " << duration_im2col.count() << " microseconds" << std::endl;
+      return;
+    }
+  }
+  */
+
+  if (kernel_h == 3 && kernel_w == 3) {
+    if (stride_h == 1) {
+      std::cout << "Im2col kernel 3 stride 1 " << std::endl;
+      im2col_3x3_stride1_with_padding_avx2(
+          input,
+          *output,
+          batch_size,
+          channels,
+          height,
+          width,
+          pads,
+          input_zp,
+          tp);
+
+      auto end_im2col = std::chrono::high_resolution_clock::now();
+      auto duration_im2col = std::chrono::duration_cast<std::chrono::microseconds>(end_im2col - start);
+      return;
+    }
+
+    if (stride_h == 2) {
+      std::cout << "Im2col kernel 3 stride 2 " << std::endl;
+      im2col_3x3_stride2_with_padding_avx2(
+          input,
+          *output,
+          batch_size,
+          channels,
+          height,
+          width,
+          pads,
+          input_zp,
+          tp);
+      auto end_im2col = std::chrono::high_resolution_clock::now();
+      auto duration_im2col = std::chrono::duration_cast<std::chrono::microseconds>(end_im2col - start);
+      // std::cout << "Conv Op - Im2col 3x3 stride 2 execution time: " << duration_im2col.count() << " microseconds" << std::endl;
+      return;
+    }
+  }
+
+  /*
+    if (kernel_h == 7 && kernel_w == 7) {
+      if (stride_h == 1) {
+        im2col_7x7_stride1_with_padding_avx2(
+            input,
+            *output,
+            batch_size,
+            channels,
+            height,
+            width,
+            pads,
+            input_zp,
+            tp);
+
+        auto end_im2col = std::chrono::high_resolution_clock::now();
+        auto duration_im2col = std::chrono::duration_cast<std::chrono::microseconds>(end_im2col - start);
+        return;
+      } else if (stride_h == 2) {
+        im2col_7x7_stride2_with_padding_avx2(
+            input,
+            *output,
+            batch_size,
+            channels,
+            height,
+            width,
+            pads,
+            input_zp,
+            tp);
+        auto end_im2col = std::chrono::high_resolution_clock::now();
+        auto duration_im2col = std::chrono::duration_cast<std::chrono::microseconds>(end_im2col - start);
+        // std::cout << "Conv Op - Im2col 3x3 stride 2 execution time: " << duration_im2col.count() << " microseconds" << std::endl;
+        return;
+      }
+    }
+    */
   int64_t padded_height = height + pads[0] + pads[2];
   int64_t padded_width = width + pads[1] + pads[3];
   const int8_t* im2col_input = nullptr;
+
   if (pads[0] == 0 && pads[1] == 0 && pads[2] == 0 && pads[3] == 0) {
     im2col_input = input;
   } else {
-    if (tp != nullptr) {
-      const int64_t total_work_items = batch_size * channels;
-
-      onnxruntime::concurrency::ThreadPool::TrySimpleParallelFor(tp, total_work_items,
-                                                                 [=](int64_t work_idx) {
-                                                                   const int64_t b = work_idx / channels;
-                                                                   const int64_t c = work_idx % channels;
-
-                                                                   const int64_t input_offset = (b * channels + c) * height * width;
-                                                                   const int64_t output_offset = (b * channels + c) * padded_height * padded_width;
-                                                                   int8_t* output_center = padded_buffer + output_offset + pads[0] * padded_width + pads[1];
-                                                                   const int8_t* input_start = input + input_offset;
-                                                                   for (int64_t h = 0; h < height; ++h) {
-                                                                     const int8_t* input_row = input_start + h * width;
-                                                                     int8_t* output_row = output_center + h * padded_width;
-
-                                                                     std::memcpy(output_row, input_row, width * sizeof(int8_t));
-                                                                   }
-                                                                 });
-    } else {
-      for (int64_t b = 0; b < batch_size; ++b) {
-        for (int64_t c = 0; c < channels; ++c) {
-          const int64_t input_offset = (b * channels + c) * height * width;
-          const int64_t output_offset = (b * channels + c) * padded_height * padded_width;
-          int8_t* output_center = padded_buffer + output_offset + pads[0] * padded_width + pads[1];
-          const int8_t* input_start = input + input_offset;
-
-          for (int64_t h = 0; h < height; ++h) {
-            const int8_t* input_row = input_start + h * width;
-            int8_t* output_row = output_center + h * padded_width;
-
-            std::memcpy(output_row, input_row, width * sizeof(int8_t));
-          }
-        }
-      }
-    }
+    apply_padding(input, padded_buffer, batch_size, channels, height, width, pads, input_zp, tp);
     im2col_input = padded_buffer;
   }
+
   auto end_padding = std::chrono::high_resolution_clock::now();
   const int64_t output_h = (padded_height - kernel_h) / stride_h + 1;
   const int64_t output_w = (padded_width - kernel_w) / stride_h + 1;
@@ -671,9 +1459,6 @@ void im2col(
     im2col_3x3(im2col_input, *output, batch_size, channels,
                padded_height, padded_width, stride_h,
                output_h, output_w, tp);
-  } else if (kernel_h == 1 && kernel_w == 1 && stride_h == 1) {
-    *output = const_cast<int8_t*>(im2col_input);
-    return;
   } else if (kernel_h == 1 && kernel_w == 1) {
     im2col_1x1(im2col_input, *output, batch_size, channels,
                padded_height, padded_width, stride_h,
@@ -894,6 +1679,7 @@ Status ComputeNudgeVConv(ConvQuantParams* conv_params, OrtKernelContext* context
       conv_params->strides[0],
       conv_params->pads,
       conv_params->padded_buffer.data(),
+      conv_params->input_zp,
       tp);
 
   auto end_im2col = std::chrono::high_resolution_clock::now();
@@ -920,7 +1706,7 @@ Status ComputeNudgeVConv(ConvQuantParams* conv_params, OrtKernelContext* context
   auto end_gemm = std::chrono::high_resolution_clock::now();
   auto duration_gemm = std::chrono::duration_cast<std::chrono::microseconds>(end_gemm - start_gemm);
   std::cout << "Conv Op - Im2col execution time: " << duration_im2col.count() << " microseconds" << std::endl;
-  std::cout << "Conv Op - Total Gemm execution time: " << duration_gemm.count() << " microseconds" << std::endl;
+  // std::cout << "Conv Op - Total Gemm execution time: " << duration_gemm.count() << " microseconds" << std::endl;
 
   return Status::OK();
 }

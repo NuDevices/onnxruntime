@@ -882,7 +882,7 @@ void acc_im2col(
               padded_height, padded_width, stride_h,
               output_h, output_w, tp);
   } else if (kernel_h == 3 && kernel_w == 3) {
-    acc_im2col_3x3(im2col_input, *output, batch_size, channels,
+    im2col_3x3_optimized(im2col_input, *output, batch_size, channels,
               padded_height, padded_width, stride_h,
               output_h, output_w, tp);
   } else if (kernel_h == 1 && kernel_w == 1) {

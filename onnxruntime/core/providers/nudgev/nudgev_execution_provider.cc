@@ -1,6 +1,6 @@
 #include "core/providers/nudgev/nudgev_execution_provider.h"
 #include "core/providers/nudgev/operators/nudgev_add.h"
-#include "core/providers/nudgev/operators/nudgev_conv_accelerated.h"
+#include "core/providers/nudgev/operators/nudgev_conv.h"
 #include "core/providers/nudgev/operators/supported_ops.h"
 #include "core/providers/nudgev/operators/nudgev_gemm.h"
 #include "core/providers/nudgev/operators/nudgev_dequantize.h"
@@ -22,11 +22,6 @@
 #include "core/platform/threadpool.h"
 #include "core/platform/ort_mutex.h"
 #include <algorithm>
-#include <unistd.h>
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <errno.h>
-#include <sys/mman.h>
 
 #include "core/providers/nudgev/mock/mock_accelerator_memory.h"
 
@@ -216,22 +211,17 @@ Status NudgevExecutionProvider::ParseProviderOptions(const ProviderOptions& prov
 }
 
 NudgevExecutionProvider::NudgevExecutionProvider(
-  const ProviderOptions& provider_options_map,
-  const SessionOptions* session_options)
-  : IExecutionProvider(kNudgevExecutionProvider) {
-if (session_options) {
-  disable_cpu_ep_fallback_ = session_options->config_options.GetConfigOrDefault(
-                                 kOrtSessionOptionsDisableCPUEPFallback, "0") == "1";
-  context_cache_enabled_ = session_options->config_options.GetConfigOrDefault(
-                               kOrtSessionOptionEpContextEnable, "0") == "1";
-}
+    const ProviderOptions& provider_options_map,
+    const SessionOptions* session_options)
+    : IExecutionProvider(kNudgevExecutionProvider) {
+  if (session_options) {
+    disable_cpu_ep_fallback_ = session_options->config_options.GetConfigOrDefault(
+                                   kOrtSessionOptionsDisableCPUEPFallback, "0") == "1";
+    context_cache_enabled_ = session_options->config_options.GetConfigOrDefault(
+                                 kOrtSessionOptionEpContextEnable, "0") == "1";
+  }
 
-ORT_ENFORCE(ParseProviderOptions(provider_options_map).IsOK());
-
-Status status = InitializeGlobalMemory();
-if (!status.IsOK()) {
-  LOGS_DEFAULT(WARNING) << "Failed to initialize global memory: " << status.ErrorMessage();
-}
+  ORT_ENFORCE(ParseProviderOptions(provider_options_map).IsOK());
 }
 
 std::shared_ptr<KernelRegistry> NudgevExecutionProvider::GetKernelRegistry() const {
@@ -245,72 +235,6 @@ std::shared_ptr<KernelRegistry> NudgevExecutionProvider::GetKernelRegistry() con
 
 DataLayout NudgevExecutionProvider::GetPreferredLayout() const {
   return DataLayout::NCHW;
-}
-
-NudgevExecutionProvider::~NudgevExecutionProvider() {
-  if (initialized_memory) {
-    CleanupGlobalMemory();
-  }
-}
-
-Status NudgevExecutionProvider::InitializeGlobalMemory() const {
-  if (initialized_memory) {
-    return Status::OK();
-  }
-
-  global_weights_bias_fd = open("/dev/xdma0_bypass", O_RDWR | O_SYNC);
-  if (global_weights_bias_fd == -1) {
-    return Status(common::ONNXRUNTIME, common::FAIL,
-                  "Failed to open /dev/xdma0_bypass, errno=" + std::to_string(errno));
-  }
-
-  global_weights_mapped_memory = mmap(nullptr, global_weights_mmap_size,
-                                      PROT_READ | PROT_WRITE, MAP_SHARED,
-                                      global_weights_bias_fd, 0);
-  if (global_weights_mapped_memory == MAP_FAILED) {
-    close(global_weights_bias_fd);
-    global_weights_bias_fd = -1;
-    return Status(common::ONNXRUNTIME, common::FAIL,
-                  "Failed to mmap weights, errno=" + std::to_string(errno));
-  }
-
-  global_bias_mapped_memory = mmap(nullptr, global_bias_mmap_size,
-                                   PROT_READ | PROT_WRITE, MAP_SHARED,
-                                   global_weights_bias_fd, BIAS_MEMORY_OFFSET);
-  if (global_bias_mapped_memory == MAP_FAILED) {
-    munmap(global_weights_mapped_memory, global_weights_mmap_size);
-    global_weights_mapped_memory = nullptr;
-    close(global_weights_bias_fd);
-    global_weights_bias_fd = -1;
-    return Status(common::ONNXRUNTIME, common::FAIL,
-                  "Failed to mmap bias, errno=" + std::to_string(errno));
-  }
-
-  global_weights_offset = 0;
-  global_bias_offset = 0;
-  initialized_memory = true;
-  return Status::OK();
-}
-
-void NudgevExecutionProvider::CleanupGlobalMemory() const {
-  if (global_weights_mapped_memory != nullptr) {
-    munmap(global_weights_mapped_memory, global_weights_mmap_size);
-    global_weights_mapped_memory = nullptr;
-  }
-
-  if (global_bias_mapped_memory != nullptr) {
-    munmap(global_bias_mapped_memory, global_bias_mmap_size);
-    global_bias_mapped_memory = nullptr;
-  }
-
-  if (global_weights_bias_fd >= 0) {
-    close(global_weights_bias_fd);
-    global_weights_bias_fd = -1;
-  }
-
-  global_weights_offset = 0;
-  global_bias_offset = 0;
-  initialized_memory = false;
 }
 
 std::vector<std::unique_ptr<ComputeCapability>>
@@ -426,6 +350,7 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
       params.N = effective_batch_size * params.output_height * params.output_width;
       params.K = input_channels * KH * KW;
       const size_t temp_buffer_size = params.N * OC;
+      const size_t input_size = effective_batch_size * input_channels * input_height * input_width;
       const size_t padded_input = effective_batch_size * input_channels * max_padded_height * max_padded_width;
       params.padded_buffer.resize(padded_input);
       params.temp_buffer.resize(temp_buffer_size);
@@ -571,27 +496,29 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
       int64_t k_blocks = (K + block_size - 1) / block_size;
       int64_t oc_blocks = (OC + block_size - 1) / block_size;
 
-      // Inizializza la memoria globale se non è già stato fatto
-      if (!initialized_memory) {
-        Status status = InitializeGlobalMemory();
-        if (!status.IsOK()) {
-          LOGS_DEFAULT(ERROR) << "Failed to initialize global memory: " << status.ErrorMessage();
-          return result;
+      // Initialize memory manager
+      auto& mem_manager = nudgev::mock::AcceleratorMemoryManager::getInstance();
+      static bool memory_initialized = false;
+      if (!memory_initialized) {
+        constexpr size_t MEMORY_SIZE = 2ULL * 1024 * 1024 * 1024;
+        constexpr size_t BIAS_OFFSET = 100ULL * 1024 * 1024;
+        mem_manager.initialize(MEMORY_SIZE, BIAS_OFFSET);
+        memory_initialized = true;
+      }
+
+      size_t weights_size = k_blocks * oc_blocks * block_size * block_size;
+      size_t weights_address = mem_manager.allocate_weights_memory(weights_size);
+
+      std::vector<int8_t> fully_transposed(K * OC, 0);
+      for (int64_t oc = 0; oc < OC; oc++) {
+        for (int64_t k = 0; k < K; k++) {
+          int64_t orig_idx = oc * K + k;
+          int64_t trans_idx = k * OC + oc;
+          fully_transposed[trans_idx] = params.weights[orig_idx];
         }
       }
-
-      // Calcola la dimensione necessaria per i pesi a blocchi
-      size_t weights_size = k_blocks * oc_blocks * block_size * block_size;
-
-      // Verifica che ci sia spazio sufficiente per i pesi
-      if (global_weights_offset + weights_size > global_weights_mmap_size) {
-        LOGS_DEFAULT(ERROR) << "Error: weights_size exceeds allocated mmap size! Requested: "
-                        << global_weights_offset + weights_size << ", Available: " << global_weights_mmap_size;
-        return result;
-      }
-
-      // Prepara i pesi a blocchi
       std::vector<int8_t> blocked_weights(weights_size, 0);
+
       for (int64_t kb = 0; kb < k_blocks; kb++) {
         for (int64_t ocb = 0; ocb < oc_blocks; ocb++) {
           int64_t block_idx = kb * oc_blocks + ocb;
@@ -602,53 +529,59 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
             for (int64_t oc_offset = 0; oc_offset < actual_oc_size; oc_offset++) {
               int64_t k_idx = kb * block_size + k_offset;
               int64_t oc_idx = ocb * block_size + oc_offset;
+              int64_t trans_idx = k_idx * OC + oc_idx;
               size_t dest_idx = block_offset + k_offset * block_size + oc_offset;
-              blocked_weights[dest_idx] = params.weights[oc_idx * K + k_idx];
+              blocked_weights[dest_idx] = fully_transposed[trans_idx];
             }
           }
         }
       }
+      bool weights_written = mem_manager.write_to_memory(
+          weights_address,
+          blocked_weights.data(),
+          blocked_weights.size());
 
-      // Copia i pesi nella memoria mappata all'offset corrente
-      void* weights_dest = static_cast<uint8_t*>(global_weights_mapped_memory) + global_weights_offset;
-      std::memcpy(weights_dest, blocked_weights.data(), weights_size);
-
-      // Prepara bias se necessario
+      if (!weights_written) {
+        std::cerr << "Error: failed to write weights to accelerator memory" << std::endl;
+        return result;
+      }
+      size_t bias_address = 0;
       if (params.has_bias) {
         size_t bias_size = oc_blocks * block_size * sizeof(int32_t);
-
-        // Verifica che ci sia spazio sufficiente per il bias
-        if (global_bias_offset + bias_size > global_bias_mmap_size) {
-          LOGS_DEFAULT(ERROR) << "Error: bias size exceeds allocated mmap size! Requested: "
-                          << global_bias_offset + bias_size << ", Available: " << global_bias_mmap_size;
-          return result;
-        }
-
-        // Prepara i bias a blocchi
+        bias_address = mem_manager.allocate_bias_memory(bias_size);
         std::vector<int32_t> bias_blocks(oc_blocks * block_size, 0);
+
         for (int64_t ocb = 0; ocb < oc_blocks; ocb++) {
           for (int64_t oc_offset = 0; oc_offset < block_size; oc_offset++) {
             int64_t oc_idx = ocb * block_size + oc_offset;
+
             if (oc_idx < OC) {
               bias_blocks[ocb * block_size + oc_offset] = params.bias[oc_idx];
             }
           }
         }
+        bool bias_written = mem_manager.write_to_memory(
+            bias_address,
+            bias_blocks.data(),
+            bias_blocks.size() * sizeof(int32_t));
 
-        // Copia i bias nella memoria mappata all'offset corrente
-        void* bias_dest = static_cast<uint8_t*>(global_bias_mapped_memory) + global_bias_offset;
-        std::memcpy(bias_dest, bias_blocks.data(), bias_size);
-
-        // Aggiorna l'offset bias per il prossimo layer
-        global_bias_offset += bias_size;
+        if (!bias_written) {
+          std::cerr << "Error: failed to write bias to accelerator memory" << std::endl;
+          return result;
+        }
       }
-
-      // Salva solo i blocchi per l'acceleratore
+      params.weights_ddr3_address = weights_address;
+      params.bias_ddr3_address = bias_address;
       params.k_blocks = k_blocks;
       params.oc_blocks = oc_blocks;
 
-      // Aggiorna l'offset per il prossimo layer di pesi
-      global_weights_offset += weights_size;
+      /*
+      std::cout << "GetCapability - Node: " << node->Name()
+      << " weights_ddr3_address: 0x" << std::hex << params.weights_ddr3_address
+      << ", bias_ddr3_address: 0x" << params.bias_ddr3_address << std::dec
+      << ", k_blocks: " << params.k_blocks
+      << ", oc_blocks: " << params.oc_blocks << std::endl;
+      */
 
       std::vector<const Node*> fused_nodes{input_dq, weight_dq, node};
       if (bias_dq) {
@@ -888,7 +821,6 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
       continue;
     }
   }
-
   for (const NodeIndex node_index : order) {
     const Node* node = graph_viewer.GetNode(node_index);
 
@@ -1069,10 +1001,6 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
       continue;
     }
   }
-  if (initialized_memory) {
-    LOGS_DEFAULT(INFO) << "Cleaning up mapped memory after graph processing";
-    CleanupGlobalMemory();
-  }
   return result;
 }
 
@@ -1107,7 +1035,7 @@ Status NudgevExecutionProvider::Compile(
       compute_info.compute_func = [](FunctionState state,
                                      const OrtApi*,
                                      OrtKernelContext* context) -> Status {
-        return onnxruntime::nudgev::ComputeNudgeVConvWithAccelerator(
+        return onnxruntime::nudgev::ComputeNudgeVConv(
             static_cast<ConvQuantParams*>(state), context);
       };
 
