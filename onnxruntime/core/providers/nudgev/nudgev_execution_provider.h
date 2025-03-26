@@ -10,9 +10,6 @@
 #include <immintrin.h>
 #include <vector>
 #include <string>
-#include <sys/mman.h>
-#include <unistd.h>
-#include <fcntl.h>
 
 namespace onnxruntime {
 
@@ -90,6 +87,8 @@ struct alignas(32) ConvQuantParams {
   int64_t output_width{};
   int64_t batch_size{};
 
+  size_t weights_ddr3_address = 0;
+  size_t bias_ddr3_address = 0;
   int64_t k_blocks = 0;
   int64_t oc_blocks = 0;
 
@@ -160,7 +159,7 @@ class NudgevExecutionProvider : public IExecutionProvider {
   explicit NudgevExecutionProvider(const ProviderOptions& provider_options_map,
                                    const SessionOptions* session_options = nullptr);
 
-  ~NudgevExecutionProvider() override;
+  ~NudgevExecutionProvider() override = default;
 
   FusionStyle GetFusionStyle() const override {
     return FusionStyle::FilteredGraphViewer;
@@ -203,19 +202,6 @@ class NudgevExecutionProvider : public IExecutionProvider {
 
   mutable bool kernel_registry_initialized_{false};
   ModelMetadefIdGenerator metadef_id_generator_;
-
-  Status InitializeGlobalMemory() const;
-  void CleanupGlobalMemory() const;
-
-  mutable void* global_weights_mapped_memory = nullptr;
-  mutable void* global_bias_mapped_memory = nullptr;
-  mutable int global_weights_bias_fd = -1;
-  mutable size_t global_weights_offset = 0;
-  mutable size_t global_bias_offset = 0;
-  mutable size_t global_weights_mmap_size = 100 * 1024 * 1024;
-  mutable size_t global_bias_mmap_size = 50 * 1024 * 1024;
-  static constexpr size_t BIAS_MEMORY_OFFSET = 100 * 1024 * 1024;
-  mutable bool initialized_memory = false;
 };
 
 }  // namespace onnxruntime
