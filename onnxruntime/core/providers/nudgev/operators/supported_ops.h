@@ -9,7 +9,7 @@ namespace nudgev {
 const std::unordered_set<std::string> kSupportedQuantizedOps = {
     "Conv",
     "Gemm",
-    "Add",
+    //"Add",
     "MaxPool"};
 
 inline bool IsQuantizedOperatorSupported(const std::string& op_type) {

@@ -1,0 +1,35 @@
+
+#pragma once
+#include "core/framework/op_kernel.h"
+#include "core/framework/tensor.h"
+#include "core/platform/threadpool.h"
+#include "core/providers/nudgev/nudgev_execution_provider.h"
+#include <vector>
+
+namespace onnxruntime {
+namespace nudgev {
+
+struct alignas(32) MulParams {
+  float input1_scale{};
+  int8_t input1_zp{};
+  float input2_scale{};
+  int8_t input2_zp{};
+  float output_scale{};
+  int8_t output_zp{};
+
+  int32_t M1_fixed{};
+  int32_t M2_fixed{};
+
+  int64_t batch_size{};
+  bool dynamic_batch{false};
+  std::vector<int64_t> input1_shape;
+  std::vector<int64_t> input2_shape;
+  std::vector<int64_t> output_shape;
+
+  bool fused_relu{false};
+};
+
+Status ComputeNudgeVMul(MulParams* mul_params, OrtKernelContext* context);
+
+}  // namespace nudgev
+}  // namespace onnxruntime

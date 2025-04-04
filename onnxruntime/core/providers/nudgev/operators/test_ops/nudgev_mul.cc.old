@@ -1,0 +1,176 @@
+#include "core/providers/nudgev/operators/nudgev_mul.h"
+#include "core/framework/op_kernel_context_internal.h"
+#include "core/mlas/inc/mlas.h"
+#include <cstring>
+#include <chrono>
+#include <iostream>
+#include <vector>
+#include <algorithm>
+#include "core/platform/threadpool.h"
+#include <immintrin.h>
+
+namespace onnxruntime {
+namespace nudgev {
+
+void nudgev_mul_quantized(
+    const int8_t* input1,
+    const int8_t* input2,
+    int8_t* output,
+    int64_t total_elements,
+    float input1_scale,
+    int8_t input1_zp,
+    float input2_scale,
+    int8_t input2_zp,
+    float output_scale,
+    int8_t output_zp,
+    bool fused_relu,
+    concurrency::ThreadPool* thread_pool) {
+  constexpr int block_size = 1024;
+
+  auto process_block = [&](int64_t start, int64_t end) {
+    std::vector<float> dequant1(end - start);
+    std::vector<float> dequant2(end - start);
+    std::vector<float> result_float(end - start);
+
+    for (int64_t i = 0; i < end - start; ++i) {
+      dequant1[i] = (static_cast<float>(input1[start + i]) - input1_zp) * input1_scale;
+      dequant2[i] = (static_cast<float>(input2[start + i]) - input2_zp) * input2_scale;
+    }
+
+    for (int64_t i = 0; i < end - start; ++i) {
+      result_float[i] = dequant1[i] * dequant2[i];
+    }
+
+    if (fused_relu) {
+      for (int64_t i = 0; i < end - start; ++i) {
+        if (result_float[i] < 0) {
+          result_float[i] = 0;
+        }
+      }
+    }
+
+    for (int64_t i = 0; i < end - start; ++i) {
+      float scaled_result = result_float[i] / output_scale;
+      int32_t quantized = static_cast<int32_t>(std::round(scaled_result)) + output_zp;
+      quantized = std::min(127, std::max(-128, quantized));
+      output[start + i] = static_cast<int8_t>(quantized);
+    }
+  };
+
+  if (thread_pool != nullptr && total_elements > block_size) {
+    const int64_t num_blocks = (total_elements + block_size - 1) / block_size;
+
+    concurrency::ThreadPool::TrySimpleParallelFor(
+        thread_pool, num_blocks,
+        [&](std::ptrdiff_t block_index) {
+          const int64_t start = block_index * block_size;
+          const int64_t end = std::min(start + block_size, total_elements);
+          process_block(start, end);
+        });
+  } else {
+    process_block(0, total_elements);
+  }
+}
+
+void nudgev_mul_dequantized(
+    const int8_t* input1,
+    const int8_t* input2,
+    int8_t* output,
+    int64_t total_elements,
+    float input1_scale,
+    int8_t input1_zp,
+    float input2_scale,
+    int8_t input2_zp,
+    float output_scale,
+    int8_t output_zp,
+    bool fused_relu,
+    concurrency::ThreadPool* thread_pool) {
+  std::vector<float> dequant_input1(total_elements);
+  std::vector<float> dequant_input2(total_elements);
+  std::vector<float> float_result(total_elements);
+
+  for (int64_t i = 0; i < total_elements; i++) {
+    dequant_input1[i] = (static_cast<float>(input1[i]) - input1_zp) * input1_scale;
+    dequant_input2[i] = (static_cast<float>(input2[i]) - input2_zp) * input2_scale;
+  }
+
+  MlasMultiply(dequant_input1.data(), dequant_input2.data(), float_result.data(),
+               static_cast<size_t>(total_elements), thread_pool);
+
+  if (fused_relu) {
+    for (int64_t i = 0; i < total_elements; i++) {
+      float_result[i] = std::max(0.0f, float_result[i]);
+    }
+  }
+
+  for (int64_t i = 0; i < total_elements; i++) {
+    float scaled_result = float_result[i] / output_scale;
+    int32_t quantized = static_cast<int32_t>(std::round(scaled_result)) + output_zp;
+    quantized = std::min(127, std::max(-128, quantized));
+    output[i] = static_cast<int8_t>(quantized);
+  }
+}
+
+Status ComputeNudgeVMul(MulParams* mul_params, OrtKernelContext* context) {
+  auto start = std::chrono::high_resolution_clock::now();
+
+  if (!mul_params) {
+    return Status(common::ONNXRUNTIME, common::FAIL, "MulParams is null");
+  }
+
+  auto* ctx_internal = reinterpret_cast<OpKernelContextInternal*>(context);
+  concurrency::ThreadPool* tp = ctx_internal->GetOperatorThreadPool();
+
+  const Tensor* input1 = ctx_internal->Input<Tensor>(0);
+  const Tensor* input2 = ctx_internal->Input<Tensor>(1);
+
+  if (!input1 || !input2) {
+    return Status(common::ONNXRUNTIME, common::FAIL, "Input tensor is null");
+  }
+
+  const auto& input1_shape = input1->Shape();
+  const auto& input2_shape = input2->Shape();
+
+  TensorShape output_shape;
+  bool broadcast_needed = input1_shape != input2_shape;
+
+  if (broadcast_needed) {
+    return Status(common::ONNXRUNTIME, common::FAIL, "Broadcasting not yet supported in NudgeV Mul");
+  } else {
+    output_shape = input1_shape;
+  }
+
+  Tensor* output = ctx_internal->Output(0, output_shape);
+  if (!output) {
+    return Status(common::ONNXRUNTIME, common::FAIL, "Failed to create output tensor");
+  }
+
+  const auto* input1_data = input1->Data<int8_t>();
+  const auto* input2_data = input2->Data<int8_t>();
+  auto* output_data = output->MutableData<int8_t>();
+
+  const int64_t total_elements = output_shape.Size();
+
+  nudgev_mul_quantized(
+      input1_data,
+      input2_data,
+      output_data,
+      total_elements,
+      mul_params->input1_scale,
+      mul_params->input1_zp,
+      mul_params->input2_scale,
+      mul_params->input2_zp,
+      mul_params->output_scale,
+      mul_params->output_zp,
+      mul_params->fused_relu,
+      tp);
+
+  auto end = std::chrono::high_resolution_clock::now();
+  auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+  std::cout << "Mul Op - Execution time: " << duration.count() << " microseconds" << std::endl;
+
+  return Status::OK();
+}
+
+}  // namespace nudgev
+}  // namespace onnxruntime

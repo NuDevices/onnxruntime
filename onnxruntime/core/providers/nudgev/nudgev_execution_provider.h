@@ -177,6 +177,17 @@ class NudgevExecutionProvider : public IExecutionProvider {
   DataLayout GetPreferredLayout() const override;
 
  private:
+  struct DequantizeCache {
+    std::shared_ptr<Tensor> tensor;
+    int reference_count;
+  };
+  mutable std::unordered_map<std::string, std::shared_ptr<Tensor>> dequantize_cache_;
+  mutable OrtMutex cache_mutex_;
+  void ClearDequantizeCache() {
+    std::lock_guard<OrtMutex> lock(cache_mutex_);
+    dequantize_cache_.clear();
+  }
+
   mutable std::unordered_map<std::string, ConvQuantParams> quant_params_map_;
   mutable std::unordered_map<std::string, GemmParams> gemm_params_map_;
   mutable std::unordered_map<std::string, DequantizeLinearParams> dequantize_params_map_;

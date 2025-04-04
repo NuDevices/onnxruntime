@@ -1007,16 +1007,127 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
 Status NudgevExecutionProvider::Compile(
     const std::vector<FusedNodeAndGraph>& fused_nodes_and_graphs,
     std::vector<NodeComputeInfo>& node_compute_funcs) {
-  // std::cout << "Compile - Starting with " << fused_nodes_and_graphs.size() << " fused nodes." << std::endl;
+  // std::cout << "NUDGEV: Inizio compilazione con " << fused_nodes_and_graphs.size() << " nodi fusi" << std::endl;
+
+  std::unordered_map<std::string, std::string> duplicate_to_original;
+  std::unordered_set<std::string> original_outputs;
+
+  for (const auto& fused_node_and_graph : fused_nodes_and_graphs) {
+    const Node& fused_node = fused_node_and_graph.fused_node;
+    if (dequantize_params_map_.find(fused_node.Name()) != dequantize_params_map_.end()) {
+      const std::string output_name = fused_node.OutputDefs()[0]->Name();
+
+      if (output_name.find("/duplicated") != std::string::npos) {
+        std::string original_name = output_name.substr(0, output_name.find("/duplicated"));
+        duplicate_to_original[output_name] = original_name;
+        original_outputs.insert(original_name);
+
+        // std::cout << "NUDGEV: Identificata relazione duplicato-originale: '"
+        //           << output_name << "' -> '" << original_name << "'" << std::endl;
+      }
+    }
+  }
+
   for (const auto& fused_node_and_graph : fused_nodes_and_graphs) {
     const Node& fused_node = fused_node_and_graph.fused_node;
     NodeComputeInfo compute_info;
-    /*
-    std::cout << "Compile - Fused node: " << fused_node.Name()
-              << ", OpType: " << fused_node.OpType()
-              << std::endl;
-    */
-    if (quant_params_map_.find(fused_node.Name()) != quant_params_map_.end()) {
+
+    if (dequantize_params_map_.find(fused_node.Name()) != dequantize_params_map_.end()) {
+      auto it = dequantize_params_map_.find(fused_node.Name());
+      if (it == dequantize_params_map_.end()) {
+        return Status(common::ONNXRUNTIME, common::FAIL, "DequantizeLinear parameters not found");
+      }
+
+      auto kernel_params = std::make_unique<DequantizeLinearParams>(std::move(it->second));
+      auto params_copy = kernel_params.get();
+
+      const std::string output_name = fused_node.OutputDefs()[0]->Name();
+
+      bool is_duplicate = duplicate_to_original.find(output_name) != duplicate_to_original.end();
+      bool is_original_with_duplicates = original_outputs.find(output_name) != original_outputs.end();
+
+      std::string cache_key = output_name;
+      if (is_duplicate) {
+        cache_key = duplicate_to_original[output_name];
+      }
+      /*
+      std::cout << "NUDGEV: DequantizeLinear '" << fused_node.Name()
+                << "' con output '" << output_name << "'"
+                << (is_duplicate ? " (DUPLICATO)" : "")
+                << (is_original_with_duplicates ? " (ORIGINALE con duplicati)" : "")
+                << ", chiave cache: '" << cache_key << "'" << std::endl;
+      */
+      compute_info.create_state_func = [params_copy](ComputeContext*, FunctionState* state) -> int {
+        *state = params_copy;
+        return 0;
+      };
+
+      compute_info.release_state_func = [](FunctionState) {};
+
+      NudgevExecutionProvider* this_provider = this;
+
+      compute_info.compute_func = [this_provider, params_copy, output_name, cache_key, is_duplicate,
+                                   is_original_with_duplicates](FunctionState state, const OrtApi*, OrtKernelContext* context) -> Status {
+        auto ctx_internal = reinterpret_cast<OpKernelContextInternal*>(context);
+
+        {
+          std::lock_guard<OrtMutex> lock(this_provider->cache_mutex_);
+          auto it = this_provider->dequantize_cache_.find(cache_key);
+          if (it != this_provider->dequantize_cache_.end()) {
+            auto start_time = std::chrono::high_resolution_clock::now();
+
+            TensorShape output_shape = it->second->Shape();
+            Tensor* output_tensor = ctx_internal->Output(0, output_shape);
+
+            memcpy(output_tensor->MutableDataRaw(),
+                   it->second->DataRaw(),
+                   it->second->SizeInBytes());
+
+            auto end_time = std::chrono::high_resolution_clock::now();
+            auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
+
+            std::cout << "DequantizeLinear Cache - Time: " << duration.count() << " μs" << std::endl;
+
+            return Status::OK();
+          }
+        }
+
+        Status status = onnxruntime::nudgev::ComputeNudgeVDequantizeLinear(
+            static_cast<DequantizeLinearParams*>(state), context);
+
+        if (!status.IsOK()) return status;
+
+        if (is_original_with_duplicates || is_duplicate) {
+          const Tensor* output_tensor = ctx_internal->Output<Tensor>(0);
+          if (!output_tensor) return Status::OK();
+          /*
+          std::cout << "NUDGEV: SALVANDO IN CACHE '" << output_name
+                    << "' (chiave: '" << cache_key << "')" << std::endl;
+          */
+          AllocatorPtr alloc = std::make_shared<CPUAllocator>();
+
+          auto cached_tensor_ptr = std::make_shared<Tensor>(
+              output_tensor->DataType(),
+              output_tensor->Shape(),
+              alloc);
+
+          memcpy(cached_tensor_ptr->MutableDataRaw(),
+                 output_tensor->DataRaw(),
+                 output_tensor->SizeInBytes());
+
+          {
+            std::lock_guard<OrtMutex> lock(this_provider->cache_mutex_);
+            if (this_provider->dequantize_cache_.find(cache_key) == this_provider->dequantize_cache_.end()) {
+              this_provider->dequantize_cache_[cache_key] = cached_tensor_ptr;
+            }
+          }
+        }
+
+        return status;
+      };
+
+      saved_dequantize_params_.push_back(std::move(kernel_params));
+    } else if (quant_params_map_.find(fused_node.Name()) != quant_params_map_.end()) {
       auto it = quant_params_map_.find(fused_node.Name());
       if (it == quant_params_map_.end()) {
         return Status(common::ONNXRUNTIME, common::FAIL, "Conv parameters not found");
@@ -1062,51 +1173,6 @@ Status NudgevExecutionProvider::Compile(
       };
 
       saved_gemm_params_.push_back(std::move(kernel_params));
-    } else if (dequantize_params_map_.find(fused_node.Name()) != dequantize_params_map_.end()) {
-      auto it = dequantize_params_map_.find(fused_node.Name());
-      if (it == dequantize_params_map_.end()) {
-        return Status(common::ONNXRUNTIME, common::FAIL, "DequantizeLinear parameters not found");
-      }
-      auto kernel_params = std::make_unique<DequantizeLinearParams>(std::move(it->second));
-      auto params_copy = kernel_params.get();
-
-      compute_info.create_state_func = [params_copy](ComputeContext*, FunctionState* state) -> int {
-        *state = params_copy;
-        return 0;
-      };
-
-      compute_info.release_state_func = [](FunctionState) {};
-      compute_info.compute_func = [](FunctionState state,
-                                     const OrtApi*,
-                                     OrtKernelContext* context) -> Status {
-        return onnxruntime::nudgev::ComputeNudgeVDequantizeLinear(
-            static_cast<DequantizeLinearParams*>(state), context);
-      };
-
-      saved_dequantize_params_.push_back(std::move(kernel_params));
-    } else if (add_params_map_.find(fused_node.Name()) != add_params_map_.end()) {
-      auto it = add_params_map_.find(fused_node.Name());
-      if (it == add_params_map_.end()) {
-        return Status(common::ONNXRUNTIME, common::FAIL, "Add parameters not found");
-      }
-      auto kernel_params = std::make_unique<AddParams>(std::move(it->second));
-      auto params_copy = kernel_params.get();
-
-      compute_info.create_state_func = [params_copy](ComputeContext*, FunctionState* state) {
-        *state = params_copy;
-        return 0;
-      };
-
-      compute_info.release_state_func = [](FunctionState) {};
-
-      compute_info.compute_func = [](FunctionState state,
-                                     const OrtApi*,
-                                     OrtKernelContext* context) -> Status {
-        return onnxruntime::nudgev::ComputeNudgeVAdd(
-            static_cast<AddParams*>(state), context);
-      };
-
-      saved_add_params_.push_back(std::move(kernel_params));
     } else {
       return Status(common::ONNXRUNTIME, common::FAIL,
                     "Unsupported operator: " + fused_node.OpType());

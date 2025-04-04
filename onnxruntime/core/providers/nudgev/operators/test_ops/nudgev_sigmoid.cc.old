@@ -1,0 +1,101 @@
+#include "core/providers/nudgev/operators/nudgev_sigmoid.h"
+#include "core/framework/op_kernel_context_internal.h"
+#include "core/mlas/inc/mlas.h"
+#include <cstring>
+#include <chrono>
+#include <iostream>
+#include <vector>
+#include <algorithm>
+#include "core/platform/threadpool.h"
+#include <immintrin.h>
+
+namespace onnxruntime {
+namespace nudgev {
+
+void nudgev_sigmoid_quantized(
+    const int8_t* input,
+    int8_t* output,
+    int64_t total_elements,
+    float input_scale,
+    int8_t input_zp,
+    float output_scale,
+    int8_t output_zp,
+    concurrency::ThreadPool* thread_pool) {
+  constexpr int block_size = 1024;
+
+  auto process_block = [&](int64_t start, int64_t end) {
+    std::vector<float> dequantized(end - start);
+    std::vector<float> sigmoid_result(end - start);
+    for (int64_t i = 0; i < end - start; ++i) {
+      dequantized[i] = (static_cast<float>(input[start + i]) - input_zp) * input_scale;
+    }
+
+    MlasComputeLogistic(dequantized.data(), sigmoid_result.data(), static_cast<size_t>(end - start));
+    for (int64_t i = 0; i < end - start; ++i) {
+      float scaled_result = sigmoid_result[i] / output_scale;
+      int32_t quantized = static_cast<int32_t>(std::round(scaled_result)) + output_zp;
+      quantized = std::min(127, std::max(-128, quantized));
+      output[start + i] = static_cast<int8_t>(quantized);
+    }
+  };
+
+  if (thread_pool != nullptr && total_elements > block_size) {
+    const int64_t num_blocks = (total_elements + block_size - 1) / block_size;
+
+    concurrency::ThreadPool::TrySimpleParallelFor(
+        thread_pool, num_blocks,
+        [&](std::ptrdiff_t block_index) {
+          const int64_t start = block_index * block_size;
+          const int64_t end = std::min(start + block_size, total_elements);
+          process_block(start, end);
+        });
+  } else {
+    process_block(0, total_elements);
+  }
+}
+
+Status ComputeNudgeVSigmoid(SigmoidParams* params, OrtKernelContext* context) {
+  auto start = std::chrono::high_resolution_clock::now();
+
+  if (!params) {
+    return Status(common::ONNXRUNTIME, common::FAIL, "SigmoidParams is null");
+  }
+
+  auto* ctx_internal = reinterpret_cast<OpKernelContextInternal*>(context);
+  concurrency::ThreadPool* tp = ctx_internal->GetOperatorThreadPool();
+
+  const Tensor* input = ctx_internal->Input<Tensor>(0);
+  if (!input) {
+    return Status(common::ONNXRUNTIME, common::FAIL, "Input tensor is null");
+  }
+
+  const auto& input_shape = input->Shape();
+  Tensor* output = ctx_internal->Output(0, input_shape);
+  if (!output) {
+    return Status(common::ONNXRUNTIME, common::FAIL, "Failed to create output tensor");
+  }
+
+  const auto* input_data = input->Data<int8_t>();
+  auto* output_data = output->MutableData<int8_t>();
+
+  const int64_t total_elements = input_shape.Size();
+
+  nudgev_sigmoid_quantized(
+      input_data,
+      output_data,
+      total_elements,
+      params->input_scale,
+      params->input_zp,
+      params->output_scale,
+      params->output_zp,
+      tp);
+
+  auto end = std::chrono::high_resolution_clock::now();
+  auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+  std::cout << "Sigmoid Op - Execution time: " << duration.count() << " microseconds" << std::endl;
+
+  return Status::OK();
+}
+
+}  // namespace nudgev
+}  // namespace onnxruntime
