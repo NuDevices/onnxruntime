@@ -15,107 +15,124 @@
 namespace onnxruntime {
 namespace nudgev {
 
-struct DequantizeCacheKey {
-  const void* input_ptr;
-  int64_t total_elements;
-  float scale;
-  int8_t zero_point;
+  template <typename T>
+class AlignedAllocator {
+ public:
+  using value_type = T;
+  using pointer = T*;
+  using size_type = std::size_t;
 
-  bool operator==(const DequantizeCacheKey& other) const {
-    return input_ptr == other.input_ptr &&
-           total_elements == other.total_elements &&
-           scale == other.scale &&
-           zero_point == other.zero_point;
+  AlignedAllocator() = default;
+
+  template <class U>
+  AlignedAllocator(const AlignedAllocator<U>&) noexcept {}
+
+  pointer allocate(size_type n) {
+    if (n > std::numeric_limits<size_type>::max() / sizeof(T)) {
+      throw std::bad_alloc();
+    }
+    void* ptr = _mm_malloc(n * sizeof(T), 32);  // 32-byte alignment for AVX
+    if (!ptr) throw std::bad_alloc();
+    return static_cast<pointer>(ptr);
   }
-};
 
-struct DequantizeCacheKeyHash {
-  std::size_t operator()(const DequantizeCacheKey& key) const {
-    std::size_t hash = std::hash<const void*>{}(key.input_ptr);
-    hash ^= std::hash<int64_t>{}(key.total_elements) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
-    hash ^= std::hash<float>{}(key.scale) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
-    hash ^= std::hash<int8_t>{}(key.zero_point) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
-    return hash;
+  void deallocate(pointer p, size_type) noexcept {
+    _mm_free(p);
   }
+
+  template <class U>
+  bool operator==(const AlignedAllocator<U>&) const { return true; }
+  template <class U>
+  bool operator!=(const AlignedAllocator<U>&) const { return false; }
 };
 
-struct DequantizeCacheEntry {
-  std::shared_ptr<std::vector<float>> data;
-  std::chrono::steady_clock::time_point last_used;
-};
-
-
-class DequantizeCache {
-public:
-  static DequantizeCache& GetInstance() {
-    static DequantizeCache instance;
+struct LastResultCache {
+ public:
+  static LastResultCache& GetInstance() {
+    static LastResultCache instance;
     return instance;
   }
 
-  const float* GetCachedResult(const DequantizeCacheKey& key) {
+  const float* GetCachedResult(const void* input_ptr, int64_t total_elements,
+                               float scale, int8_t zero_point) {
     std::lock_guard<std::mutex> lock(cache_mutex_);
 
-    auto it = cache_.find(key);
-    if (it != cache_.end()) {
-      it->second.last_used = std::chrono::steady_clock::now();
-      return it->second.data->data();
+    if (input_ptr == last_input_ptr && total_elements == last_total_elements &&
+        scale == last_scale && zero_point == last_zero_point) {
+      return cached_data.data();
     }
     return nullptr;
   }
 
-  void CacheResult(const DequantizeCacheKey& key, const float* data, int64_t size) {
+  void CacheResult(const void* input_ptr, int64_t total_elements,
+                   float scale, int8_t zero_point, const float* data, int64_t size,
+                   concurrency::ThreadPool* tp) {
     std::lock_guard<std::mutex> lock(cache_mutex_);
 
-     if too large, evict oldest entries
-    if (cache_.size() > MAX_CACHE_ENTRIES) {
-      EvictOldestEntries();
-    }
+    // Update cache key
+    last_input_ptr = input_ptr;
+    last_total_elements = total_elements;
+    last_scale = scale;
+    last_zero_point = zero_point;
 
-    auto vec_ptr = std::make_shared<std::vector<float>>(size);
-    std::memcpy(vec_ptr->data(), data, size * sizeof(float));
-
-    DequantizeCacheEntry entry;
-    entry.data = vec_ptr;
-    entry.last_used = std::chrono::steady_clock::now();
-
-    cache_[key] = std::move(entry);
+    // Resize and copy data in parallel
+    cached_data.resize(size);
+    ParallelCopy(data, cached_data.data(), size, tp);
   }
 
   void Clear() {
     std::lock_guard<std::mutex> lock(cache_mutex_);
-    cache_.clear();
+    cached_data.clear();
+    last_input_ptr = nullptr;
+    last_total_elements = 0;
+    last_scale = 0.0f;
+    last_zero_point = 0;
   }
 
-private:
-  DequantizeCache() = default;
-  ~DequantizeCache() = default;
+  void ParallelCopy(const float* src, float* dst, int64_t size, concurrency::ThreadPool* tp) {
+    constexpr int64_t chunk_size = 4096;
+    const int64_t num_chunks = (size + chunk_size - 1) / chunk_size;
 
-  DequantizeCache(const DequantizeCache&) = delete;
-  DequantizeCache& operator=(const DequantizeCache&) = delete;
+    auto copy_task = [&](int64_t start, int64_t end) {
+      constexpr int64_t vec_size = 8;
+      int64_t i = start;
+      for (; i + vec_size <= end; i += vec_size) {
+        __m256 vec = _mm256_loadu_ps(src + i);
+        _mm256_store_ps(dst + i, vec);
+      }
+      for (; i < end; ++i) {
+        dst[i] = src[i];
+      }
+    };
 
-  void EvictOldestEntries() {
-    if (cache_.empty()) return;
-
-    std::vector<std::pair<DequantizeCacheKey, std::chrono::steady_clock::time_point>> entries;
-    entries.reserve(cache_.size());
-
-    for (const auto& entry : cache_) {
-      entries.emplace_back(entry.first, entry.second.last_used);
-    }
-
-    std::sort(entries.begin(), entries.end(),
-              [](const auto& a, const auto& b) { return a.second < b.second; });
-
-    size_t to_remove = cache_.size() / 4;
-    if (to_remove == 0) to_remove = 1;
-
-    for (size_t i = 0; i < to_remove && i < entries.size(); ++i) {
-      cache_.erase(entries[i].first);
+    if (tp) {
+      concurrency::ThreadPool::TrySimpleParallelFor(
+          tp, num_chunks,
+          [&](std::ptrdiff_t chunk_idx) {
+            const int64_t start = chunk_idx * chunk_size;
+            const int64_t end = std::min(start + chunk_size, size);
+            copy_task(start, end);
+          });
+    } else {
+      copy_task(0, size);
     }
   }
 
-  static constexpr size_t MAX_CACHE_ENTRIES = 50;
-  std::unordered_map<DequantizeCacheKey, DequantizeCacheEntry, DequantizeCacheKeyHash> cache_;
+ private:
+  LastResultCache() = default;
+  ~LastResultCache() = default;
+
+  LastResultCache(const LastResultCache&) = delete;
+  LastResultCache& operator=(const LastResultCache&) = delete;
+
+  // Cache key data
+  const void* last_input_ptr = nullptr;
+  int64_t last_total_elements = 0;
+  float last_scale = 0.0f;
+  int8_t last_zero_point = 0;
+
+  // Cache data with aligned allocation
+  std::vector<float, AlignedAllocator<float>> cached_data;
   std::mutex cache_mutex_;
 };
 
@@ -261,6 +278,7 @@ void nudgev_dequantize_linear_int32(
 
 Status ComputeNudgeVDequantizeLinear(DequantizeLinearParams* dequantize_params, OrtKernelContext* context) {
   auto start = std::chrono::high_resolution_clock::now();
+  constexpr int64_t cache_threshold = 1024;  // Adjust based on profiling
 
   if (!dequantize_params) {
     return Status(common::ONNXRUNTIME, common::FAIL, "dequantize_params is null");
@@ -282,66 +300,52 @@ Status ComputeNudgeVDequantizeLinear(DequantizeLinearParams* dequantize_params, 
     return Status(common::ONNXRUNTIME, common::FAIL, "failed to create output tensor");
   }
 
-  auto* output_data = output->MutableData<float>();
+  float* output_data = output->MutableData<float>();
   if (!output_data) {
     return Status(common::ONNXRUNTIME, common::FAIL, "Output data is null");
   }
 
   const int64_t total_elements = input->Shape().Size();
+  bool use_cache = total_elements >= cache_threshold;
 
   if (data_type == DataTypeImpl::GetType<int8_t>()) {
-    const auto* input_data = input->Data<int8_t>();
+    const int8_t* input_data = input->Data<int8_t>();
     if (!input_data) {
       return Status(common::ONNXRUNTIME, common::FAIL, "Input data is null");
     }
 
     try {
-      DequantizeCacheKey cache_key{
-        input_data,
-        total_elements,
-        dequantize_params->scale,
-        dequantize_params->zero_point
-      };
-
-      auto& cache = DequantizeCache::GetInstance();
-      const float* cached_result = cache.GetCachedResult(cache_key);
+      auto& cache = LastResultCache::GetInstance();
+      const float* cached_result = use_cache ? cache.GetCachedResult(
+          input_data, total_elements, dequantize_params->scale, dequantize_params->zero_point) : nullptr;
 
       if (cached_result) {
-        // Cache hit
-        std::memcpy(output_data, cached_result, total_elements * sizeof(float));
+        // Parallel vectorized copy
+        cache.ParallelCopy(cached_result, output_data, total_elements, tp);
 
         auto end = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
         std::cout << "DequantizeLinear Op - Cache HIT: " << duration.count() << " microseconds" << std::endl;
       } else {
-        // Cache miss
-        nudgev_dequantize_linear(
-            input_data,
-            output_data,
-            total_elements,
-            dequantize_params->scale,
-            dequantize_params->zero_point,
-            tp);
+        nudgev_dequantize_linear(input_data, output_data, total_elements,
+                                dequantize_params->scale, dequantize_params->zero_point, tp);
 
-        cache.CacheResult(cache_key, output_data, total_elements);
+        if (use_cache) {
+          cache.CacheResult(input_data, total_elements, dequantize_params->scale,
+                          dequantize_params->zero_point, output_data, total_elements, tp);
+        }
 
         auto end = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
         std::cout << "DequantizeLinear Op - Cache MISS: " << duration.count() << " microseconds" << std::endl;
       }
     } catch (const std::exception& e) {
-      // Fall back to normal computation if caching fails
       std::cerr << "Cache error: " << e.what() << ". Falling back to normal computation." << std::endl;
-
-      nudgev_dequantize_linear(
-          input_data,
-          output_data,
-          total_elements,
-          dequantize_params->scale,
-          dequantize_params->zero_point,
-          tp);
+      nudgev_dequantize_linear(input_data, output_data, total_elements,
+                              dequantize_params->scale, dequantize_params->zero_point, tp);
     }
   } else if (data_type == DataTypeImpl::GetType<int32_t>()) {
+    // int32_t handling remains unchanged
     const auto* input_data = input->Data<int32_t>();
     if (!input_data) {
       return Status(common::ONNXRUNTIME, common::FAIL, "Input data is null");
