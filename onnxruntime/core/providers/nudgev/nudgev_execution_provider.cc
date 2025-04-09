@@ -594,14 +594,14 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
       uint64_t model_hash;
       int metadef_id = this->metadef_id_generator_.GenerateId(graph_viewer, model_hash);
 
-      auto node_name = MakeString("NudgevExecutionProvider_", model_hash, "_", metadef_id, "_", metadef_id);
+      auto node_name = MakeString("NudgevExecutionProvider_", model_hash, "_conv_", metadef_id, "_", metadef_id);
       quant_params_map_[node_name] = std::move(params);
 
       result.push_back(utils::MakeComputeCapability(
           graph_viewer,
           fused_nodes,
           [model_hash, metadef_id]() {
-            return MakeString(model_hash, "_", metadef_id);
+            return MakeString(model_hash, "_conv_", metadef_id);
           },
           kNudgevExecutionProvider,
           false));
@@ -791,28 +791,24 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
         }
       }
 
-      // Calculate scaling factor (M) for quantized gemm
       float M = params.input_scale * params.weight_scale / params.output_scale;
       params.M_fixed = static_cast<int32_t>(M * (1 << 15));
 
-      // Create a unique node name for this GEMM node
       uint64_t model_hash;
       int metadef_id = this->metadef_id_generator_.GenerateId(graph_viewer, model_hash);
-      auto node_name = MakeString("NudgevExecutionProvider_", model_hash, "_", metadef_id, "_", metadef_id);
+      auto node_name = MakeString("NudgevExecutionProvider_", model_hash, "_gemm_", metadef_id, "_", metadef_id);
       gemm_params_map_[node_name] = std::move(params);
 
-      // Collect all the nodes that will be fused
       std::vector<const Node*> fused_nodes{input_dq, weight_dq, node};
       if (output_q && output_q->OpType() == "QuantizeLinear") {
         fused_nodes.push_back(output_q);
       }
 
-      // Add compute capability
       result.push_back(utils::MakeComputeCapability(
           graph_viewer,
           fused_nodes,
           [model_hash, metadef_id]() {
-            return MakeString(model_hash, "_", metadef_id);
+            return MakeString(model_hash, "_gemm_", metadef_id);
           },
           kNudgevExecutionProvider,
           false));
@@ -897,14 +893,14 @@ NudgevExecutionProvider::GetCapability(const GraphViewer& graph_viewer,
 
       uint64_t model_hash;
       int metadef_id = this->metadef_id_generator_.GenerateId(graph_viewer, model_hash);
-      auto node_name = MakeString("NudgevExecutionProvider_", model_hash, "_", metadef_id, "_", metadef_id);
+      auto node_name = MakeString("NudgevExecutionProvider_", model_hash, "_dqlinear_", metadef_id, "_", metadef_id);
 
       dequantize_params_map_[node_name] = std::move(params);
       result.push_back(utils::MakeComputeCapability(
           graph_viewer,
           {node},
           [model_hash, metadef_id]() {
-            return MakeString(model_hash, "_", metadef_id);
+            return MakeString(model_hash, "_dqlinear_", metadef_id);
           },
           kNudgevExecutionProvider,
           false));
